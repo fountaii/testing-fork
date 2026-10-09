@@ -76,6 +76,10 @@ constexpr uint32_t ImageSampleAddressComponents(uint32_t flags, ImageDimension d
 	if ((flags & ImageSampleFlagLod) != 0) {
 		components++;
 	}
+	// The _CL clamp follows the body (RDNA2 ISA 8.2.4, Table 43).
+	if ((flags & ImageSampleFlagLodClamp) != 0) {
+		components++;
+	}
 	if ((flags & ImageSampleFlagDerivative) != 0) {
 		components += ImageGradientComponents(dimension) * 2u;
 	}
@@ -200,6 +204,7 @@ constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
     {0x0fu, Opcode::IMAGE_ATOMIC_SWAP, true},
     {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
     {0x11u, Opcode::IMAGE_ATOMIC_ADD, true},
+    {0x12u, Opcode::IMAGE_ATOMIC_SUB},
     {0x14u, Opcode::IMAGE_ATOMIC_SMIN},
     {0x15u, Opcode::IMAGE_ATOMIC_UMIN, true},
     {0x16u, Opcode::IMAGE_ATOMIC_SMAX},
@@ -207,6 +212,8 @@ constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
     {0x18u, Opcode::IMAGE_ATOMIC_AND, true},
     {0x19u, Opcode::IMAGE_ATOMIC_OR, true},
     {0x1au, Opcode::IMAGE_ATOMIC_XOR, true},
+    {0x1bu, Opcode::IMAGE_ATOMIC_INC},
+    {0x1cu, Opcode::IMAGE_ATOMIC_DEC},
     {0x1eu, Opcode::IMAGE_ATOMIC_FMIN},
     {0x1fu, Opcode::IMAGE_ATOMIC_FMAX},
 };
@@ -234,8 +241,8 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
-		case 0xe6u:
-		case 0xe7u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		case 0xe7u: return Opcode::IMAGE_BVH64_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -264,8 +271,6 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 	}
 
 	switch (opcode) {
-		case 0xe6u: return 11u;
-		case 0xe7u: return 12u;
 		case 0x0eu: return 1u;
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
@@ -274,6 +279,13 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 		case 0x60u: return ImageCoordComponents(dimension);
 		default: return 0;
 	}
+}
+
+// RDNA2 ISA 8.2.10, Table 48: node_pointer (one dword, two for BVH64), ray_extent, ray_origin.xyz,
+// then ray_dir.xyz and ray_inv_dir.xyz as six f32 dwords, or with A16 as three dwords holding
+// {dir.x, dir.y}, {dir.z, inv_dir.x}, {inv_dir.y, inv_dir.z} (low half first).
+constexpr uint32_t BvhAddressDwords(bool bvh64, bool a16) {
+	return (bvh64 ? 2u : 1u) + 4u + (a16 ? 3u : 6u);
 }
 
 uint32_t CountDmaskComponents(uint32_t dmask) {
@@ -347,6 +359,8 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.data_dwords        = d16 ? (inst.data_components + 1u) / 2u : inst.data_components;
 	inst.glc                = ((word0 >> 13u) & 1u) != 0;
 	inst.slc                = ((word0 >> 25u) & 1u) != 0;
+	inst.tfe                = ((word0 >> 16u) & 1u) != 0;
+	inst.lwe                = ((word0 >> 17u) & 1u) != 0;
 	inst.image_sample_flags = DecodeMimgSampleFlags(sample, gather);
 	if (a16) {
 		inst.image_sample_flags |= ImageSampleFlagA16;
@@ -361,8 +375,24 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
 	SetRawWords(inst, code, word_index, word_count);
 
+	const bool bvh = inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY ||
+	                 inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY;
+	if (bvh) {
+		inst.image_address_components =
+		    BvhAddressDwords(inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY, a16);
+	}
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
+	} else if (bvh && inst.dmask != 0xfu) {
+		// RDNA2 ISA 8.2.10 restrictions. DIM, UNRM and SSAMP are placeholders the instruction
+		// ignores; these four change the register footprint or the resource format.
+		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect requires DMASK=0xf");
+	} else if (bvh && !r128) {
+		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect requires a 128-bit T# (R128=1)");
+	} else if (bvh && (inst.tfe || inst.lwe)) {
+		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect does not support TFE or LWE");
+	} else if (bvh && nsa_dwords != 0u && 1u + nsa_dwords * 4u < inst.image_address_components) {
+		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersect NSA form has too few addresses");
 	}
 	if (gather != nullptr && !std::has_single_bit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,
@@ -386,11 +416,6 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                          opcode == 0x01u || opcode == 0x08u || opcode == 0x09u;
 	if (d16 && !supports_d16) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
-	}
-	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY &&
-	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
-		SetUnsupported(inst, Family::MIMG, opcode,
-		               "BVH intersection requires full-float ray DWORDs and R128/dmask:0xf");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);

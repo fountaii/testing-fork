@@ -4,11 +4,12 @@
 #include "graphics/shader/recompiler/ir/Reg.h"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 
-#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -16,6 +17,12 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Block;
 class Inst;
+struct Program;
+
+// ir/ProgramClone.cpp: deep copy of a translated program (copies every private member).
+[[nodiscard]] bool CloneProgram(const Program& source, Program& target);
+// ir/ProgramCodec.cpp: byte encoding of resource plans (reads and writes every private member).
+struct ProgramCodecAccess;
 
 class Value {
 public:
@@ -55,6 +62,8 @@ public:
 	bool operator==(const Value& other) const;
 
 private:
+	friend struct ProgramCodecAccess;
+
 	Type type = Type::Void;
 	union {
 		Inst*     inst;
@@ -123,10 +132,16 @@ public:
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
 	// Runtime indices belong to the resource plan that owns this instruction.
+	// Lazy assignment is for plan construction and unsealed, single-threaded programs.
 	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
 		if (evaluation_index == UINT32_MAX) {
 			evaluation_index = count++;
 		}
+		return evaluation_index;
+	}
+	// A sealed plan assigned every index at extraction; reading one never writes.
+	[[nodiscard]] uint32_t SealedEvaluationIndex() const {
+		EXIT_IF(evaluation_index == UINT32_MAX);
 		return evaluation_index;
 	}
 
@@ -134,7 +149,20 @@ public:
 	void SetArg(size_t index, Value value);
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
+	void ReplaceOpcode(ValueOpcode opcode);
 	void Invalidate();
+	// KYTY_IR_LINEAR_USES (CodegenOptions::ir_linear_uses), Senaxx 5145dc1f9:
+	// Detaches without maintaining other instructions' use lists: only when every instruction
+	// that refers to this one is destroyed with it (Program::~Program).
+	void DropForDestruction();
+	// RemoveIdentities: ReplaceUsesWith(replacement, false) for an instruction about to be erased,
+	// leaving its own entries in its arguments' use lists; the caller drops those for every
+	// removed instruction at once (DropRemovedUses), which keeps every list in the same order.
+	// Uses by instructions already in `removed` (erased) are skipped. Arguments go to `touched`.
+	void ReplaceUsesForRemoval(Value replacement, const std::unordered_set<const Inst*>& removed,
+	                           std::vector<Inst*>& touched);
+	static void DropRemovedUses(std::span<Inst* const>              touched,
+	                            const std::unordered_set<const Inst*>& removed);
 
 	template <typename T>
 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
@@ -152,29 +180,21 @@ public:
 	}
 
 private:
-	friend void EliminateDeadCode(const std::vector<Block*>& blocks);
+	// Copy and encode every member below; update both (and their layout checks) when adding one.
+	friend bool CloneProgram(const Program& source, Program& target);
+	friend struct ProgramCodecAccess;
 
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
 
-	static constexpr uint8_t InlineArity = 4;
-	static constexpr uint8_t PhiArity = UINT8_MAX;
-
 	ValueOpcode         opcode;
-	uint8_t             num_args;
-	bool                live = false;
-	mutable uint32_t    evaluation_index = UINT32_MAX;
 	uint64_t            flags;
 	Block*              parent = nullptr;
-	union {
-		std::array<Value, InlineArity> fixed_args {};
-		std::vector<Value> large_args;
-		std::vector<std::pair<Block*, Value>> phi_args;
-	};
+	std::vector<Value>  args;
+	std::vector<Block*> phi_blocks;
 	std::vector<Use>    uses;
+	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
-
-static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hangTrace.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
@@ -12,6 +13,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/faultCost.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -31,6 +33,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -174,6 +177,74 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	std::memcpy(code, bytes, sizeof(bytes));
 	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), thunk_size);
 	return reinterpret_cast<uint64_t>(code);
+}
+
+// Hang trace: route a resolved guest->HLE PLT import through a tiny counting thunk.
+//   movabs r11, &counter ; lock inc qword [r11] ; movabs r11, target ; jmp r11
+// r11 is a SysV scratch register that is never used for arguments, and the jump keeps the
+// guest return address and stack exactly as the direct call would. Counters live in ordinary
+// host memory, away from the executable page.
+static std::mutex            g_count_thunk_mutex;
+static std::vector<uint64_t> g_count_thunk_pages;
+static uint64_t              g_count_thunk_offset = 0;
+
+static uint64_t GetCountingImportThunk(uint64_t target, const RelocationInfo& ri,
+                                       const Program* program) {
+	if (target == 0 || HangTrace::IsGuestAddress(target)) {
+		return target;
+	}
+	std::scoped_lock lock(g_count_thunk_mutex);
+	if (const auto existing = HangTrace::FindImportThunk(target); existing != 0) {
+		return existing;
+	}
+	const auto program_name =
+	    program != nullptr ? Common::PathToString(program->file_name.filename()) : std::string();
+	auto* counter = HangTrace::AllocateImportCounter(target, ri.name, ri.dbg_name, program_name);
+	if (counter == nullptr) {
+		return target;
+	}
+
+	constexpr uint64_t thunk_size = 32;
+	if (g_count_thunk_pages.empty() || g_count_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
+		auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, UNRESOLVED_STUB_PAGE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+		    "hang_trace_import_thunk");
+		if (page == 0) {
+			return target;
+		}
+		g_count_thunk_pages.push_back(page);
+		g_count_thunk_offset = 0;
+	}
+	auto* code = reinterpret_cast<uint8_t*>(g_count_thunk_pages.back() + g_count_thunk_offset);
+	g_count_thunk_offset += thunk_size;
+
+	uint8_t    bytes[thunk_size];
+	std::memset(bytes, 0xcc, sizeof(bytes));
+	size_t     i      = 0;
+	const auto emit   = [&](uint8_t b) { bytes[i++] = b; };
+	const auto emit64 = [&](uint64_t v) {
+		std::memcpy(bytes + i, &v, sizeof(v));
+		i += sizeof(v);
+	};
+	emit(0x49);
+	emit(0xbb);
+	emit64(reinterpret_cast<uint64_t>(counter)); // movabs r11, counter
+	emit(0xf0);
+	emit(0x49);
+	emit(0xff);
+	emit(0x03); // lock inc qword ptr [r11]
+	emit(0x49);
+	emit(0xbb);
+	emit64(target); // movabs r11, target
+	emit(0x41);
+	emit(0xff);
+	emit(0xe3); // jmp r11
+	EXIT_NOT_IMPLEMENTED(i > thunk_size);
+	std::memcpy(code, bytes, sizeof(bytes));
+	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), thunk_size);
+	const auto thunk = reinterpret_cast<uint64_t>(code);
+	HangTrace::SetImportThunk(target, thunk);
+	return thunk;
 }
 
 static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
@@ -656,6 +727,83 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Guest memory tracking faults (and hang-trace LOD watch hits). Never terminates: returns false
+// for every exception it does not resolve.
+static bool TryHandleGuestAccessFault(const Common::HostException::ExceptionInfo& exception_info) {
+	const auto* info = &exception_info;
+	if (info->type != Common::HostException::ExceptionType::AccessViolation) {
+		return false;
+	}
+	using CoreAccess = Common::HostException::AccessViolationType;
+	using GpuAccess  = Libs::Graphics::PageFaultAccess;
+	GpuAccess access;
+	switch (info->access_violation_type) {
+		case CoreAccess::Read: access = GpuAccess::Read; break;
+		case CoreAccess::Write: access = GpuAccess::Write; break;
+		case CoreAccess::Execute: access = GpuAccess::Execute; break;
+		default: return false;
+	}
+	if (HangTrace::Enabled()) {
+		char fault_thread[32] = "(host thread)";
+		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			char name[64] {};
+			if (Libs::LibKernel::PthreadGetname(self, name) == 0) {
+				std::snprintf(fault_thread, sizeof(fault_thread), "%s", name);
+			}
+		}
+		const uint64_t gpr[16] = {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi,
+		                          info->rbp, info->rsp, info->r8,  info->r9,  info->r10, info->r11,
+		                          info->r12, info->r13, info->r14, info->r15};
+		if (HangTrace::HandleLodWatchFault(info->access_violation_vaddr, access == GpuAccess::Write,
+		                                   info->exception_address, gpr, fault_thread)) {
+			return true;
+		}
+		HangTrace::SetFaultContext(info->exception_address, fault_thread);
+		HangTrace::SetReadbackKind(access == GpuAccess::Write ? HangTrace::ReadbackKind::FaultWrite
+		                                                      : HangTrace::ReadbackKind::FaultRead);
+	}
+	if (Libs::Graphics::FaultCost::MapEnabled()) {
+		Libs::Graphics::FaultCost::SetFaultInstruction(info->exception_address);
+	}
+	const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+	if (HangTrace::Enabled()) {
+		HangTrace::ClearFaultContext();
+	}
+	return handled;
+}
+
+// The live log's line for the AMD CPU patch (FaultCost::SetPeriodicReporter): VRSQRTPS traps per
+// frame, from the sites the instruction patcher could not give a native trampoline; each costs
+// about one guest fault round trip of the startup benchmark (the exception dispatch; the
+// emulation itself ~0.07 us, timed with KYTY_AMD_CPU_TIMING=1).
+static void ReportReciprocalSqrtTraps(double seconds, uint64_t frames) {
+	static Loader::X64InstructionEmulator::ReciprocalSqrtStats previous {};
+	const auto current = Loader::X64InstructionEmulator::GetReciprocalSqrtStats();
+	const auto traps   = current.traps - previous.traps;
+	const auto ns      = current.emulate_ns - previous.emulate_ns;
+	previous           = current;
+	const auto& bench  = Libs::Graphics::FaultCost::StartupBenchmark();
+	const auto  rate   = seconds > 0 ? static_cast<double>(traps) / seconds : 0.0;
+	std::printf("Kyty AMD instruction patch (Intel CPUs): last %.0f s: %.1f VRSQRTPS traps/frame (%.0f/s)", seconds,
+	            frames != 0 ? static_cast<double>(traps) / static_cast<double>(frames) : 0.0, rate);
+	if (bench.valid) {
+		std::printf(", ~%.1f CPU cores busy trapping (%.2f us per trap round trip)",
+		            rate * (bench.fault_us - bench.fault_handler_us) / 1e6,
+		            bench.fault_us - bench.fault_handler_us);
+	}
+	if (ns != 0 && traps != 0) {
+		std::printf(", %.2f us emulation each", static_cast<double>(ns) / static_cast<double>(traps) / 1e3);
+	}
+	std::printf("\n");
+}
+
+// KYTY_VEH_FIRST=0 leaves guest tracking faults to the last-registered handler only, so every
+// other process-wide vectored handler sees each tracking fault first (the previous behaviour).
+static bool FirstAccessHandlerEnabled() {
+	const auto* value = std::getenv("KYTY_VEH_FIRST");
+	return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -664,19 +812,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
-	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
-		using CoreAccess = Common::HostException::AccessViolationType;
-		using GpuAccess  = Libs::Graphics::PageFaultAccess;
-		GpuAccess access;
-		switch (info->access_violation_type) {
-			case CoreAccess::Read: access = GpuAccess::Read; break;
-			case CoreAccess::Write: access = GpuAccess::Write; break;
-			case CoreAccess::Execute: access = GpuAccess::Execute; break;
-			case CoreAccess::Unknown: return false;
-		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			return true;
-		}
+	if (TryHandleGuestAccessFault(exception_info)) {
+		return true;
+	}
+	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    info->access_violation_type == Common::HostException::AccessViolationType::Unknown) {
+		return false;
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
@@ -712,6 +853,38 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// The faulting host call chain, unwound from the fault context (symbolize the addresses
+		// with llvm-symbolizer --obj=kyty_emulator.exe). A frame without unwind data (guest code)
+		// continues from the return address at RSP while that is readable.
+		if (info->native_context != nullptr) {
+			CONTEXT context = *static_cast<const CONTEXT*>(info->native_context);
+			std::printf("host call chain:");
+			for (int frame = 0; frame < 32 && context.Rip != 0; frame++) {
+				std::printf("%s 0x%016" PRIx64, (frame % 4 == 0) ? "\n " : "",
+				            static_cast<uint64_t>(context.Rip));
+				DWORD64     image_base = 0;
+				auto*       function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+				if (function == nullptr) {
+					if (!IsReadableRange(context.Rsp, sizeof(uint64_t))) {
+						break;
+					}
+					context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+					context.Rsp += sizeof(uint64_t);
+					continue;
+				}
+				// The unwind reads saved registers and the return address from this frame.
+				if (!IsReadableRange(context.Rsp, 512)) {
+					break;
+				}
+				void*   handler_data = nullptr;
+				DWORD64 establisher  = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+				                 &handler_data, &establisher, nullptr);
+			}
+			std::printf("\n");
+		}
+#endif
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
@@ -878,7 +1051,14 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	const auto ri      = GetRelocationInfo(r, program);
 	auto       value   = ri.value;
 	bool       stubbed = false;
-	if (!ri.resolved) {
+	if (ri.resolved) {
+		// KYTY_HANG_TRACE imports: resolved PLT calls go through a counting thunk.
+		if (jmprela_table && ri.type == SymbolType::Func && !ri.bind_self &&
+		    (ri.bind == BindType::Global || ri.bind == BindType::Weak) &&
+		    HangTrace::ImportsEnabled()) {
+			value = GetCountingImportThunk(value, ri, program);
+		}
+	} else {
 		const bool weak = ri.bind == BindType::Weak || !program->fail_if_global_not_resolved;
 		if (!weak) {
 			LOGF("Stubbed: %s\n",
@@ -1196,6 +1376,8 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 
 	if (program->elf->IsValid()) {
 		LoadProgramToMemory(program);
+		HangTrace::RegisterGuestCode(program->base_vaddr, program->base_size,
+		                             Common::PathToString(elf_name.filename()));
 		ParseProgramDynamicInfo(program);
 		CreateSymbolDatabase(program);
 	} else {
@@ -1670,7 +1852,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
+#if !defined(__APPLE__)
 	const bool emulate_amd = Config::AmdCpuEnabled();
+#else
+	const bool emulate_amd = false;
+#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
 #else
@@ -1715,6 +1901,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
+	}
+	if (FirstAccessHandlerEnabled()) {
+		// Guest tracking faults are the hot path: resolve them before any other vectored handler.
+		// Faults it does not resolve still reach KytyExceptionHandler, registered last.
+		(void)Common::HostException::InstallFirstAccessHandler(TryHandleGuestAccessFault);
 	}
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
@@ -1794,8 +1985,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		if (!have_function_starts) {
 			Log::WriteToConsoleAndLog(
 			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
+			                emulate_amd ? "AMD instruction patch for Intel CPUs" : "Guest red-zone protection",
 			                module_name));
+		}
+		if (emulate_amd) {
+			X64InstructionEmulator::ConfigureReciprocalSqrtStats();
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
@@ -1831,6 +2025,19 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				if (!details.empty()) details += "; ";
 				details += fmt::format("{}: native={}, trapped={}, skipped={}", name, counts.native,
 				                       counts.trapped, counts.Skipped());
+				// Why sites have no native trampoline (the reasons add up to trapped + skipped, less
+				// INSERTQ/RDPID, which trap by design).
+				std::string reasons;
+				for (size_t i = 0; i < PatchRejectionCount; ++i) {
+					if (counts.rejected[i] != 0) {
+						reasons += fmt::format("{}{}={}", reasons.empty() ? "" : ", ",
+						                       PatchRejectionName(static_cast<PatchRejection>(i)),
+						                       counts.rejected[i]);
+					}
+				}
+				if (!reasons.empty()) {
+					details += fmt::format(" [no native: {}]", reasons);
+				}
 			}
 			const auto  found   = combined.found;
 			const auto  skipped = combined.Skipped();
@@ -1839,7 +2046,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			                      : skipped != 0     ? "partially patched"
 			                                         : "patched";
 			Log::WriteToConsoleAndLog(
-			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
+			    fmt::format("AMD instruction patch for Intel CPUs: {} {} ({})\n", module_name, status, details));
+			if (totals.reciprocal_sqrt.found != 0) {
+				// The live log's VRSQRTPS trap rate: sites without a native trampoline still trap.
+				Libs::Graphics::FaultCost::SetPeriodicReporter(ReportReciprocalSqrtTraps);
+			}
 		}
 	}
 

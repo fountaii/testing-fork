@@ -5,6 +5,8 @@
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
+#include "libs/audioDiag.h"
+#include "libs/audioMix.h"
 #include "libs/audio_internal.h"
 #include "libs/controller.h"
 #include "libs/dualSenseHaptics.h"
@@ -14,7 +16,10 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <magic_enum.hpp>
 #include <vector>
 
@@ -61,6 +66,52 @@ static bool audio_out_port_type_is_valid(int type) {
 	       type == AUDIO_OUT_PORT_TYPE_AUX;
 }
 
+static const char* audio_out_port_type_name(int type) {
+	switch (type) {
+		case AUDIO_OUT_PORT_TYPE_MAIN: return "main";
+		case AUDIO_OUT_PORT_TYPE_BGM: return "bgm";
+		case AUDIO_OUT_PORT_TYPE_VOICE: return "voice";
+		case AUDIO_OUT_PORT_TYPE_PERSONAL: return "personal";
+		case AUDIO_OUT_PORT_TYPE_PADSPK: return "pad speaker";
+		case AUDIO_OUT_PORT_TYPE_VIBRATION: return "vibration";
+		case AUDIO_OUT_PORT_TYPE_AUDIO3D: return "audio3d";
+		case AUDIO_OUT_PORT_TYPE_AUX: return "aux";
+		default: return "unknown";
+	}
+}
+
+// The host's default playback device as SDL sees it, once: a device whose format or period
+// differs from the usual 48 kHz stereo changes how output is paced.
+static void report_default_playback_device() {
+	static std::atomic_bool reported {false};
+	if (!Diag::Console().Enabled() || reported.exchange(true)) {
+		return;
+	}
+	SDL_AudioSpec spec {};
+	int           frames = 0;
+	const char*   name   = SDL_GetAudioDeviceName(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK);
+	if (SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, &frames)) {
+		Diag::Print("default playback device '%s': %d Hz, %d ch, format 0x%04x, %d-frame period",
+		            name != nullptr ? name : "?", spec.freq, spec.channels,
+		            static_cast<unsigned>(spec.format), frames);
+	} else {
+		Diag::Print("default playback device '%s': format unknown (%s)", name != nullptr ? name : "?",
+		            SDL_GetError());
+	}
+	int   count   = 0;
+	auto* devices = SDL_GetAudioPlaybackDevices(&count);
+	for (int i = 0; devices != nullptr && i < count && i < 16; i++) {
+		SDL_AudioSpec device_spec {};
+		int           device_frames = 0;
+		const char*   device_name   = SDL_GetAudioDeviceName(devices[i]);
+		const bool    known = SDL_GetAudioDeviceFormat(devices[i], &device_spec, &device_frames);
+		Diag::Print("playback device %d: '%s' %d Hz, %d ch, %d-frame period", i,
+		            device_name != nullptr ? device_name : "?", known ? device_spec.freq : 0,
+		            known ? device_spec.channels : 0, known ? device_frames : 0);
+	}
+	SDL_free(devices);
+}
+
 } // namespace
 
 class Audio {
@@ -89,9 +140,8 @@ public:
 	};
 
 	struct OutputParam {
-		Id           handle;
-		const void*  data  = nullptr;
-		const float* gains = nullptr;
+		Id          handle;
+		const void* data = nullptr;
 	};
 
 	Audio() = default;
@@ -106,6 +156,12 @@ public:
 	bool     AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume);
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
+
+	void SetMixSettings(const Mix::Settings& settings) { m_mix = settings; }
+	[[nodiscard]] const Mix::Settings& GetMixSettings() const { return m_mix; }
+	// Every LEVEL_LOG_INTERVAL_US, print each active output port's RMS and peak (KYTY_AUDIO_LEVELS).
+	void SetLevelLogging(bool enabled) { m_level_logging = enabled; }
+	static constexpr uint64_t LEVEL_LOG_INTERVAL_US = 5000000;
 
 	Id       AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
 	int      AudioInClose(Id handle);
@@ -129,6 +185,12 @@ private:
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
+
+		Mix::LevelMeter meter;
+		uint64_t        meter_start   = 0;
+		uint32_t        meter_on_main = 0; // Blocks that played on the main output.
+		uint32_t        meter_blocks  = 0;
+		float           meter_gain    = 1.0f;
 	};
 
 	struct PortIn {
@@ -148,6 +210,10 @@ private:
 	Common::Mutex m_mutex;
 	PortOut       m_out_ports[OUT_PORTS_MAX];
 	PortIn        m_in_ports[IN_PORTS_MAX];
+	Mix::Settings m_mix;
+	bool          m_level_logging = false;
+
+	void MeterOutput(int port_id, PortOut* port, const void* data, bool on_main, float gain);
 
 	static bool            FormatIsFloat(Format format);
 	static bool            FormatIsStd(Format format);
@@ -159,10 +225,8 @@ private:
 	static void            OpenSdlDevice(PortIn* port, Format format);
 	static void            CloseSdlDevice(PortIn* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
-	                                           std::vector<uint8_t>* buffer, float gain,
-	                                           const float* gains);
-	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
-	                          const float* gains);
+	                                           std::vector<uint8_t>* buffer, float gain);
+	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain);
 };
 
 static Audio* g_audio = nullptr;
@@ -198,7 +262,7 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	for (uint32_t i = 0; i < num; i++) {
 		if (params[i].handle > 0 && params[i].data != nullptr) {
 			output_params.push_back(
-			    Audio::OutputParam {Audio::Id(params[i].handle), params[i].data, params[i].gains});
+			    Audio::OutputParam {Audio::Id(params[i].handle), params[i].data});
 		}
 	}
 
@@ -216,6 +280,19 @@ void Initialize() {
 	EXIT_IF(g_audio != nullptr);
 
 	g_audio = new Audio;
+
+	Mix::Settings mix;
+	mix.master      = Config::GetAudioMasterVolume();
+	mix.main        = Config::GetAudioMainVolume();
+	mix.music       = Config::GetAudioMusicVolume();
+	mix.pad_on_main = Config::GetAudioPadSpeakerOnMainVolume();
+	mix             = Mix::ApplyEnvironment(mix, [](const char* name) { return std::getenv(name); });
+	g_audio->SetMixSettings(mix);
+	const char* levels = std::getenv("KYTY_AUDIO_LEVELS");
+	g_audio->SetLevelLogging(levels != nullptr && levels[0] != '\0' && levels[0] != '0');
+	std::printf("Kyty audio mix: master %u%%, main %u%%, music (BGM ports) %u%%, pad speaker on main "
+	            "output %u%%\n",
+	            mix.master, mix.main, mix.music, mix.pad_on_main);
 }
 
 void Shutdown() {
@@ -265,8 +342,10 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 
 	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
 		LOGF("AudioOut: SDL audio init failed: %s\n", SDL_GetError());
+		Diag::Print("SDL audio init failed: %s", SDL_GetError());
 		return false;
 	}
+	report_default_playback_device();
 
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
@@ -277,11 +356,14 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	                                         nullptr);
 	if (port->stream == nullptr) {
 		LOGF("AudioOut: SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
+		Diag::Print("cannot open the default playback device (%d Hz, %d ch): %s", desired.freq,
+		            desired.channels, SDL_GetError());
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return false;
 	}
 	if (!SDL_ResumeAudioStreamDevice(port->stream)) {
 		LOGF("AudioOut: SDL_ResumeAudioStreamDevice failed: %s\n", SDL_GetError());
+		Diag::Print("cannot start the default playback device: %s", SDL_GetError());
 		CloseSdlDevice(port);
 		return false;
 	}
@@ -304,8 +386,7 @@ void Audio::CloseSdlDevice(PortOut* port) {
 }
 
 const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
-                                       std::vector<uint8_t>* buffer, float gain,
-                                       const float* gains) {
+                                       std::vector<uint8_t>* buffer, float gain) {
 	EXIT_IF(data == nullptr);
 	EXIT_IF(buffer == nullptr);
 
@@ -315,12 +396,12 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	const auto bytes_per_sample = BytesPerSample(port.format);
 	const bool reorder          = channels >= 8 && !FormatIsStd(port.format);
 
-	std::array<double, 12> scales {};
-	bool                   volume_changed = false;
+	bool volume_changed = gain != 1.0f;
 	for (uint32_t ch = 0; ch < channels; ch++) {
-		scales[ch] = (static_cast<double>(port.volume[ch]) / 32768.0) * gain *
-		             (gains != nullptr ? gains[ch] : 1.0f);
-		volume_changed |= scales[ch] != 1.0;
+		if (port.volume[ch] != 32768) {
+			volume_changed = true;
+			break;
+		}
 	}
 
 	if (!volume_changed && !reorder) {
@@ -340,7 +421,8 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
 				dst[frame * output_channels + ch] =
-				    static_cast<float>(src[frame * channels + src_ch] * scales[src_ch]);
+				    src[frame * channels + src_ch] *
+				    (static_cast<float>(port.volume[src_ch]) / 32768.0f) * gain;
 			}
 			if (channels == 12) {
 				// Add the four top channels to their front/back channels, turning 12 into 8.
@@ -348,7 +430,8 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				static constexpr uint32_t HEIGHT_DST[4] = {0, 1, 4, 5};
 				for (uint32_t ch = 0; ch < 4; ch++) {
 					dst[frame * output_channels + HEIGHT_DST[ch]] +=
-					    static_cast<float>(src[frame * channels + 8 + ch] * scales[8 + ch]);
+					    src[frame * channels + 8 + ch] *
+					    (static_cast<float>(port.volume[8 + ch]) / 32768.0f) * gain;
 				}
 			}
 		}
@@ -359,9 +442,15 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
-				const double sample = src[frame * channels + src_ch] * scales[src_ch];
-				dst[frame * output_channels + ch] = static_cast<int16_t>(
-				    std::clamp(sample, -32768.0, 32767.0));
+				int64_t sample =
+				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
+				sample = static_cast<int64_t>(sample * static_cast<double>(gain));
+				if (sample > std::numeric_limits<int16_t>::max()) {
+					sample = std::numeric_limits<int16_t>::max();
+				} else if (sample < std::numeric_limits<int16_t>::min()) {
+					sample = std::numeric_limits<int16_t>::min();
+				}
+				dst[frame * output_channels + ch] = static_cast<int16_t>(sample);
 			}
 		}
 	}
@@ -369,8 +458,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
-bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
-                          const float* gains) {
+bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain) {
 	EXIT_IF(port == nullptr);
 
 	if (port->stream == nullptr || data == nullptr) {
@@ -378,7 +466,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	}
 
 	std::vector<uint8_t> prepared_buffer;
-	const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer, gain, gains);
+	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer, gain);
 	const auto           output_channels = OutputChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
@@ -467,10 +555,19 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				    Controller::DualSenseHaptics::Open(freq, type == AUDIO_OUT_PORT_TYPE_PADSPK);
 			}
 
+			Diag::Print("output port %d open: %s, %u frames, %u Hz, %s (%d ch); main output %s, "
+			            "DualSense stream %s",
+			            id + 1, audio_out_port_type_name(type), samples_num, freq,
+			            magic_enum::enum_name(format).data(), port.channels_num,
+			            port.stream != nullptr ? "open" : "none",
+			            port.haptics != nullptr ? "created" : "none");
+
 			return Id::Create(id);
 		}
 	}
 
+	Diag::Print("output port open failed: all %d ports in use (%s, %u frames, %u Hz)",
+	            OUT_PORTS_MAX, audio_out_port_type_name(type), samples_num, freq);
 	return Id::Invalid();
 }
 
@@ -480,6 +577,7 @@ bool Audio::AudioOutClose(Id handle) {
 	if (AudioOutValid(handle)) {
 		auto& port = m_out_ports[handle.GetId()];
 
+		Diag::Print("output port %d close: %s", handle.ToInt(), audio_out_port_type_name(port.type));
 		CloseSdlDevice(&port);
 		port = {};
 
@@ -501,6 +599,38 @@ bool Audio::AudioOutHasDevice(Id handle) {
 
 	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
 	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].stream != nullptr);
+}
+
+void Audio::MeterOutput(int port_id, PortOut* port, const void* data, bool on_main, float gain) {
+	const auto now = LibKernel::KernelGetProcessTime();
+	if (port->meter_start == 0) {
+		port->meter_start = now;
+	}
+	port->meter.Add(data, port->samples_num, static_cast<uint32_t>(port->channels_num),
+	                FormatIsFloat(port->format));
+	port->meter_blocks++;
+	port->meter_on_main += on_main ? 1 : 0;
+	port->meter_gain = gain;
+	if (now - port->meter_start < LEVEL_LOG_INTERVAL_US) {
+		return;
+	}
+	// Raw levels are the guest's samples; "out" adds the guest's port volume (channel 0) and
+	// the host gain, i.e. what reaches the device.
+	const double volume = static_cast<double>(port->volume[0]) / 32768.0;
+	const double rms    = port->meter.Rms();
+	const double peak   = port->meter.Peak();
+	std::printf("AudioLevel: t=%.1f s port %d %s %dch %uHz: raw rms %.1f dBFS peak %.1f dBFS; guest vol "
+	            "%.2f host gain %.2f -> out rms %.1f dBFS; %u/%u blocks on main output (%.1f s)\n",
+	            static_cast<double>(now) / 1e6, port_id + 1, audio_out_port_type_name(port->type),
+	            port->channels_num, port->freq, Mix::LevelMeter::ToDb(rms), Mix::LevelMeter::ToDb(peak), volume,
+	            static_cast<double>(port->meter_gain),
+	            Mix::LevelMeter::ToDb(rms * volume * port->meter_gain), port->meter_on_main,
+	            port->meter_blocks, static_cast<double>(now - port->meter_start) / 1e6);
+	std::fflush(stdout);
+	port->meter.Reset();
+	port->meter_start   = now;
+	port->meter_blocks  = 0;
+	port->meter_on_main = 0;
 }
 
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {
@@ -551,6 +681,8 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];
+		// The DualSense speaker/vibration setting also scales a pad speaker port that falls back
+		// to the main output, so the speaker hotkey keeps working there.
 		const float gain =
 		    port.type == AUDIO_OUT_PORT_TYPE_PADSPK
 		        ? Controller::GetSettingScale(Controller::Setting::SpeakerVolume)
@@ -566,18 +698,26 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 			controller_queued_us = Controller::DualSenseHaptics::Queue(
 			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
 			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume,
-			    gain, params[i].gains);
+			    gain);
 			controller_uses_bluetooth =
 			    Controller::DualSenseHaptics::UsesBluetooth(port.haptics);
 		}
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
 			// output instead, and a vibration port has none.
-			if (QueueSdlAudio(&port, params[i].data, blocking, gain, params[i].gains)) {
+			const float main_gain = gain * Mix::MainOutputGain(m_mix, port.type, true);
+			if (m_level_logging) {
+				MeterOutput(params[i].handle.GetId(), &port, params[i].data,
+				            port.stream != nullptr, main_gain);
+			}
+			if (QueueSdlAudio(&port, params[i].data, blocking, main_gain)) {
 				any_device = true;
 				paced[i]   = port.queue_primed;
 			}
 		} else {
+			if (m_level_logging) {
+				MeterOutput(params[i].handle.GetId(), &port, params[i].data, false, gain);
+			}
 			port.queue_primed = false;
 			// Bluetooth HID has its own sender. Let the sample clock pace a batch
 			// without another audio device, instead of waiting on the HID queue.
@@ -632,10 +772,12 @@ static bool RecordingDevicePresent(SDL_AudioDeviceID device) {
 void Audio::OpenSdlDevice(PortIn* port, Format format) {
 	const auto& name = Config::GetAudioInputDevice();
 	if (name.empty()) {
+		Diag::Print("input port: no microphone configured; the game records silence");
 		return;
 	}
 	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
 		LOGF("AudioIn: SDL init failed: %s\n", SDL_GetError());
+		Diag::Print("input port: SDL audio init failed: %s", SDL_GetError());
 		return;
 	}
 	int                device_count = 0;
@@ -651,6 +793,8 @@ void Audio::OpenSdlDevice(PortIn* port, Format format) {
 	SDL_free(devices);
 	if (device == 0) {
 		LOGF("AudioIn: cannot find '%s'; using silence\n", name.c_str());
+		Diag::Print("input port: microphone '%s' not found; the game records silence",
+		            name.c_str());
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return;
 	}
@@ -661,11 +805,14 @@ void Audio::OpenSdlDevice(PortIn* port, Format format) {
 	port->stream     = SDL_OpenAudioDeviceStream(device, &desired, nullptr, nullptr);
 	if (port->stream == nullptr) {
 		LOGF("AudioIn: cannot open '%s': %s; using silence\n", name.c_str(), SDL_GetError());
+		Diag::Print("input port: cannot open microphone '%s': %s", name.c_str(), SDL_GetError());
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return;
 	}
 	port->device = device;
 	LOGF("AudioIn: opened '%s' (%u Hz, %d ch)\n", name.c_str(), port->freq, desired.channels);
+	Diag::Print("input port: recording from '%s' (%u Hz, %d ch)", name.c_str(), port->freq,
+	            desired.channels);
 }
 
 void Audio::CloseSdlDevice(PortIn* port) {
@@ -854,11 +1001,14 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 	     "\t freq    = %u\n",
 	     user_id, type, index, len, freq);
 
+	Diag::Print("sceAudioOutOpen(user %d, type %d (%s), index %d, %u frames, %u Hz, param 0x%x)",
+	            user_id, type, audio_out_port_type_name(type), index, len, freq, param);
+
 	if (!audio_out_port_type_is_valid(type)) {
-		return AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+		return Diag::Error("sceAudioOutOpen", AUDIO_OUT_ERROR_INVALID_PORT_TYPE, type);
 	}
 	if (freq == 0) {
-		return AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ;
+		return Diag::Error("sceAudioOutOpen", AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ, freq);
 	}
 	EXIT_NOT_IMPLEMENTED(index != 0);
 
@@ -886,9 +1036,10 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 	auto id = g_audio->AudioOutOpen(type, len, freq, format);
 
 	if (!id.IsValid()) {
-		return AUDIO_OUT_ERROR_PORT_FULL;
+		return Diag::Error("sceAudioOutOpen", AUDIO_OUT_ERROR_PORT_FULL, type);
 	}
 
+	Diag::Print("sceAudioOutOpen -> handle %d", id.ToInt());
 	return id.ToInt();
 }
 
@@ -896,7 +1047,7 @@ int KYTY_SYSV_ABI AudioOutClose(int handle) {
 	PRINT_NAME();
 
 	if (!g_audio->AudioOutClose(Audio::Id(handle))) {
-		return AUDIO_OUT_ERROR_INVALID_PORT;
+		return Diag::Error("sceAudioOutClose", AUDIO_OUT_ERROR_INVALID_PORT, handle);
 	}
 
 	return OK;
@@ -909,7 +1060,7 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 	int channels_num = 0;
 
 	if (!g_audio->AudioOutGetStatus(Audio::Id(handle), &type, &channels_num)) {
-		return AUDIO_OUT_ERROR_INVALID_PORT;
+		return Diag::Error("sceAudioOutGetPortState", AUDIO_OUT_ERROR_INVALID_PORT, handle);
 	}
 
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
@@ -959,7 +1110,7 @@ int KYTY_SYSV_ABI AudioOutSetVolume(int handle, uint32_t flag, int* vol) {
 	EXIT_NOT_IMPLEMENTED(vol == nullptr);
 
 	if (!g_audio->AudioOutSetVolume(Audio::Id(handle), flag, vol)) {
-		return AUDIO_OUT_ERROR_INVALID_PORT;
+		return Diag::Error("sceAudioOutSetVolume", AUDIO_OUT_ERROR_INVALID_PORT, handle);
 	}
 
 	return OK;
@@ -970,7 +1121,7 @@ int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
 
 	EXIT_NOT_IMPLEMENTED(param == nullptr);
 	if (num == 0 || num > Audio::OUT_PORTS_MAX) {
-		return AUDIO_OUT_ERROR_INVALID_SIZE;
+		return Diag::Error("sceAudioOutOutputs", AUDIO_OUT_ERROR_INVALID_SIZE, num);
 	}
 
 	Audio::OutputParam params[Audio::OUT_PORTS_MAX];
@@ -982,7 +1133,7 @@ int KYTY_SYSV_ABI AudioOutOutputs(AudioOutOutputParam* param, uint32_t num) {
 		params[i].data   = param[i].ptr;
 
 		if (!g_audio->AudioOutValid(params[i].handle)) {
-			return AUDIO_OUT_ERROR_INVALID_PORT;
+			return Diag::Error("sceAudioOutOutputs", AUDIO_OUT_ERROR_INVALID_PORT, param[i].handle);
 		}
 	}
 
@@ -1000,7 +1151,7 @@ int KYTY_SYSV_ABI AudioOutOutput(int handle, const void* ptr) {
 	params[0].data   = ptr;
 
 	if (!g_audio->AudioOutValid(params[0].handle)) {
-		return AUDIO_OUT_ERROR_INVALID_PORT;
+		return Diag::Error("sceAudioOutOutput", AUDIO_OUT_ERROR_INVALID_PORT, handle);
 	}
 
 	return static_cast<int>(g_audio->AudioOutOutputs(params, 1));
@@ -1021,17 +1172,21 @@ static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t fre
 	     "\t freq    = %u\n",
 	     user_id, type, index, len, freq);
 
+	const char* api = asynchronous ? "sceAudioInHqOpen" : "sceAudioInOpen";
+	Diag::Print("%s(user %d, type %d, index %d, %u frames, %u Hz, param 0x%x)", api, user_id, type,
+	            index, len, freq, param);
+
 	if (type != 0 && type != 1) {
-		return AUDIO_IN_ERROR_INVALID_TYPE;
+		return Diag::Error(api, AUDIO_IN_ERROR_INVALID_TYPE, type);
 	}
 	if (index != 0) {
-		return AUDIO_IN_ERROR_INVALID_PARAM;
+		return Diag::Error(api, AUDIO_IN_ERROR_INVALID_PARAM, index);
 	}
 	if (len != 128 && (asynchronous || len != 256)) {
-		return AUDIO_IN_ERROR_INVALID_SIZE;
+		return Diag::Error(api, AUDIO_IN_ERROR_INVALID_SIZE, len);
 	}
 	if (freq != 48000 && (asynchronous || freq != 16000)) {
-		return AUDIO_IN_ERROR_INVALID_FREQ;
+		return Diag::Error(api, AUDIO_IN_ERROR_INVALID_FREQ, freq);
 	}
 
 	Audio::Format format = Audio::Format::Unknown;
@@ -1042,7 +1197,7 @@ static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t fre
 		case 0x10:
 		case 0x11: format = Audio::Format::FloatMono; break;
 		case 0x12: format = Audio::Format::FloatStereo; break;
-		default: return AUDIO_IN_ERROR_INVALID_PARAM;
+		default: return Diag::Error(api, AUDIO_IN_ERROR_INVALID_PARAM, param);
 	}
 
 	LOGF("\t param   = %u (%s)\n", param, magic_enum::enum_name(format));
@@ -1052,9 +1207,10 @@ static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t fre
 	auto id = g_audio->AudioInOpen(len, freq, format, asynchronous);
 
 	if (!id.IsValid()) {
-		return AUDIO_IN_ERROR_PORT_FULL;
+		return Diag::Error(api, AUDIO_IN_ERROR_PORT_FULL, len);
 	}
 
+	Diag::Print("%s -> handle %d", api, id.ToInt());
 	return id.ToInt();
 }
 
@@ -1074,19 +1230,21 @@ int KYTY_SYSV_ABI AudioInClose(int handle) {
 	PRINT_NAME();
 	EXIT_IF(g_audio == nullptr);
 	if (handle <= 0) {
-		return AUDIO_IN_ERROR_INVALID_HANDLE;
+		return Diag::Error("sceAudioInClose", AUDIO_IN_ERROR_INVALID_HANDLE, handle);
 	}
-	return g_audio->AudioInClose(Audio::Id(handle));
+	const int result = g_audio->AudioInClose(Audio::Id(handle));
+	return result < 0 ? Diag::Error("sceAudioInClose", result, handle) : result;
 }
 
 int KYTY_SYSV_ABI AudioInInput(int handle, void* dest) {
 	PRINT_NAME();
 	EXIT_IF(g_audio == nullptr);
 	if (handle <= 0) {
-		return AUDIO_IN_ERROR_INVALID_HANDLE;
+		return Diag::Error("sceAudioInInput", AUDIO_IN_ERROR_INVALID_HANDLE, handle);
 	}
 
-	return g_audio->AudioInInput(Audio::Id(handle), dest);
+	const int result = g_audio->AudioInInput(Audio::Id(handle), dest);
+	return result < 0 ? Diag::Error("sceAudioInInput", result, handle) : result;
 }
 
 int KYTY_SYSV_ABI AudioInGetSilentState(int handle) {
@@ -1095,10 +1253,11 @@ int KYTY_SYSV_ABI AudioInGetSilentState(int handle) {
 	EXIT_IF(g_audio == nullptr);
 
 	if (handle <= 0) {
-		return AUDIO_IN_ERROR_INVALID_HANDLE;
+		return Diag::Error("sceAudioInGetSilentState", AUDIO_IN_ERROR_INVALID_HANDLE, handle);
 	}
 
-	return g_audio->AudioInGetSilentState(Audio::Id(handle));
+	const int result = g_audio->AudioInGetSilentState(Audio::Id(handle));
+	return result < 0 ? Diag::Error("sceAudioInGetSilentState", result, handle) : result;
 }
 
 } // namespace AudioIn

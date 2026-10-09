@@ -25,9 +25,11 @@
 
 #include <SDL3/SDL.h>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -362,29 +364,59 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 	SetPause(game, false);
 }
 
+/// Resizes the drawable surface to the given pixel dimensions.
+/// Sets `minimized = false` on a positive size; sets `minimized = true` and returns early on a
+/// nonpositive one.
 void WindowContext::Resize(int new_width, int new_height) {
 	if (new_width <= 0 || new_height <= 0) {
+		LOGF("WindowContext::Resize(): ignoring nonpositive resize request (%dx%d); window is "
+		     "likely minimized/hidden\n",
+		     new_width, new_height);
+		minimized.store(true, std::memory_order_release);
 		return;
 	}
 	Common::LockGuard lock(mutex);
 	graphic_ctx.screen_width  = static_cast<uint32_t>(new_width);
 	graphic_ctx.screen_height = static_cast<uint32_t>(new_height);
+	minimized.store(false, std::memory_order_release);
 }
 
+/// Queries the current drawable pixel size from SDL and calls Resize() to clear `minimized`.
+/// Skips the call when the window is still minimised or SDL reports a non-positive size.
+void WindowContext::RefreshSizeFromWindow() {
+	if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {
+		return;
+	}
+	int width  = 0;
+	int height = 0;
+	if (SDL_GetWindowSizeInPixels(window, &width, &height) && width > 0 && height > 0) {
+		Resize(width, height);
+	}
+}
+
+/// Dispatches a single SDL window event and keeps `minimized` up to date.
+/// Sets `minimized = true` on HIDDEN/MINIMIZED or non-positive sizes;
+/// clears it on RESTORED/MAXIMIZED, positive PIXEL_SIZE_CHANGED, SHOWN, or EXPOSED.
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 	const auto& window_event = event;
 	switch (window_event.type) {
-		case SDL_EVENT_WINDOW_SHOWN:
+		case SDL_EVENT_WINDOW_SHOWN: {
 			LOGF("Window %" PRIu32 " shown\n", window_event.windowID);
+			RefreshSizeFromWindow();
 			break;
+		}
 
-		case SDL_EVENT_WINDOW_HIDDEN:
+		case SDL_EVENT_WINDOW_HIDDEN: {
 			LOGF("Window %" PRIu32 " hidden\n", window_event.windowID);
+			minimized.store(true, std::memory_order_release);
 			break;
+		}
 
-		case SDL_EVENT_WINDOW_EXPOSED:
+		case SDL_EVENT_WINDOW_EXPOSED: {
 			LOGF("Window %" PRIu32 " exposed\n", window_event.windowID);
+			RefreshSizeFromWindow();
 			break;
+		}
 
 		case SDL_EVENT_WINDOW_MOVED:
 			LOGF("Window %" PRIu32 " moved to %" PRId32 ",%" PRId32 "\n", window_event.windowID,
@@ -394,24 +426,43 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 		case SDL_EVENT_WINDOW_RESIZED:
 			LOGF("Window %" PRIu32 " resized to %" PRId32 "x%" PRId32 "\n", window_event.windowID,
 			     window_event.data1, window_event.data2);
+			if (window_event.data1 <= 0 || window_event.data2 <= 0) {
+				LOGF("Window %" PRIu32 " ignoring non-positive resize %" PRId32 "x%" PRId32 "\n",
+				     window_event.windowID, window_event.data1, window_event.data2);
+				minimized.store(true, std::memory_order_release);
+			}
 			break;
 
 		case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
 			LOGF("Window %" PRIu32 " size changed to %" PRId32 "x%" PRId32 "\n",
 			     window_event.windowID, window_event.data1, window_event.data2);
 
-			Resize(window_event.data1, window_event.data2);
+			if (window_event.data1 > 0 && window_event.data2 > 0) {
+				Resize(window_event.data1, window_event.data2);
+			} else {
+				LOGF("Window %" PRIu32 " ignoring non-positive size change %" PRId32 "x%" PRId32
+				     "\n",
+				     window_event.windowID, window_event.data1, window_event.data2);
+				minimized.store(true, std::memory_order_release);
+			}
 
 			break;
 
 		case SDL_EVENT_WINDOW_MINIMIZED:
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
+			minimized.store(true, std::memory_order_release);
 			break;
 		case SDL_EVENT_WINDOW_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
+			minimized.store(false, std::memory_order_release);
+			// Refresh the cached drawable size in case no PIXEL_SIZE_CHANGED event follows.
+			RefreshSizeFromWindow();
 			break;
 		case SDL_EVENT_WINDOW_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
+			minimized.store(false, std::memory_order_release);
+			// Refresh the cached drawable size in case no PIXEL_SIZE_CHANGED event follows.
+			RefreshSizeFromWindow();
 			break;
 		case SDL_EVENT_WINDOW_MOUSE_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);
@@ -722,7 +773,6 @@ void WindowContext::Run() {
 	loop.need_exit = false;
 	loop.paused.store(false, std::memory_order_release);
 
-
 	while (!loop.need_exit) {
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
@@ -732,7 +782,7 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		if (!HostInputWaitEvent(&loop.event, 1000)) {
+		if (!HostInputWaitEvent(&loop.event)) {
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
@@ -826,7 +876,6 @@ void WindowRun() {
 	EXIT_IF(g_window == nullptr);
 
 	g_window->Run();
-	Common::LockGuard lock(g_window->render_context->GetMutex());
 	g_window->render_context->GetPipelineCache().Save();
 }
 
@@ -914,6 +963,21 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
+// KYTY_TITLE_UPDATE=sync restores the synchronous title update (the present thread waits for the
+// window thread).
+static bool TitleUpdateSync() {
+	static const bool sync = [] {
+		const auto* value = std::getenv("KYTY_TITLE_UPDATE");
+		return value != nullptr && std::strcmp(value, "sync") == 0;
+	}();
+	return sync;
+}
+
+static std::mutex   g_title_mutex;
+static std::string  g_title_text;
+static SDL_WindowID g_title_window_id     = 0;
+static bool         g_title_update_queued = false;
+
 void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame, bool dlss_bypassed) {
 	static char title[128];
 	static char title_id[12];
@@ -983,24 +1047,49 @@ void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame, bool dls
 	                      : (frame_generation->External() ? " [OptiScaler FG: FSR]" : " [FG]"))
 	               : "");
 
-	struct TitleUpdate {
-		SDL_WindowID window_id;
-		std::string  text;
-	};
-	// Presentation must not wait for the UI event loop. Own the text until the
-	// callback runs, and resolve the window on the UI thread in case it closed.
-	auto* update = new TitleUpdate {SDL_GetWindowID(window), std::move(text)};
-	if (!SDL_RunOnMainThread(
-	        [](void* data) {
-		        std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
-		        if (auto* target = SDL_GetWindowFromID(title->window_id); target != nullptr) {
-			        SDL_SetWindowTitle(target, title->text.c_str());
-		        }
-	        },
-	        update, false)) {
-		delete update;
-		EXIT("Could not schedule window title update: %s\n", SDL_GetError());
+	if (TitleUpdateSync()) {
+		struct TitleUpdate {
+			SDL_Window*  window;
+			std::string* text;
+		} update {window, &text};
+		EXIT_IF(!SDL_RunOnMainThread(
+		    [](void* data) {
+			    auto& title = *static_cast<TitleUpdate*>(data);
+			    SDL_SetWindowTitle(title.window, title.text->c_str());
+		    },
+		    &update, true));
+		return;
 	}
+
+	// The present thread calls this before it fires the flip events, so it must not wait for the
+	// window thread: that thread runs at the guest threads' priority and, when every CPU is busy,
+	// can stay ready for a whole quantum. The newest title goes into one slot, and at most one
+	// main-thread callback is queued to apply it (bounded, however long the main thread lags).
+	{
+		std::lock_guard lock(g_title_mutex);
+		g_title_text      = std::move(text);
+		g_title_window_id = SDL_GetWindowID(window);
+		if (g_title_update_queued) {
+			return;
+		}
+		g_title_update_queued = true;
+	}
+	EXIT_IF(!SDL_RunOnMainThread(
+	    [](void* /*data*/) {
+		    std::string  pending_text;
+		    SDL_WindowID window_id = 0;
+		    {
+			    std::lock_guard lock(g_title_mutex);
+			    pending_text          = g_title_text;
+			    window_id             = g_title_window_id;
+			    g_title_update_queued = false;
+		    }
+		    // The window may be gone by the time the main thread runs this.
+		    if (auto* target = SDL_GetWindowFromID(window_id); target != nullptr) {
+			    SDL_SetWindowTitle(target, pending_text.c_str());
+		    }
+	    },
+	    nullptr, false));
 }
 
 } // namespace Libs::Graphics

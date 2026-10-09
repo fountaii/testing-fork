@@ -31,61 +31,6 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 	return ret;
 }
 
-uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
-                                   uint32_t search_iterations, uint32_t default_resource) {
-	const auto LoadMapping = [&](uint32_t index) {
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
-		                          index);
-		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-		return value;
-	};
-	const auto mapping = ConstantU32(state, mapping_offset);
-	const auto count = LoadMapping(mapping);
-	if (search_iterations == 0u) {
-		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
-		                          ConstantU32(state, 2u));
-		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
-		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
-		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
-		                          ConstantU32(state, mapping_offset + 1u));
-		return Select(state, TypeU32(state), valid, LoadMapping(entry),
-		              ConstantU32(state, default_resource));
-	}
-	const auto entry_at = [&](uint32_t index) {
-		return Binary(state, spv::OpIAdd, TypeU32(state), mapping,
-		              Binary(state, spv::OpIAdd, TypeU32(state),
-		                     Binary(state, spv::OpShiftLeftLogical, TypeU32(state), index,
-		                            ConstantU32(state, 1u)), ConstantU32(state, 1u)));
-	};
-	auto low = ConstantU32(state, 0u);
-	auto high = count;
-	for (uint32_t iteration = 0; iteration < search_iterations; ++iteration) {
-		const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
-		const auto mid = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
-		                        Binary(state, spv::OpIAdd, TypeU32(state), low, high),
-		                        ConstantU32(state, 1u));
-		const auto probe = Select(state, TypeU32(state), active, mid, ConstantU32(state, 0u));
-		const auto less = Binary(state, spv::OpULessThan, TypeBool(state),
-		                         LoadMapping(entry_at(probe)), key);
-		low = Select(state, TypeU32(state),
-		             Binary(state, spv::OpLogicalAnd, TypeBool(state), active, less),
-		             Binary(state, spv::OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low);
-		high = Select(state, TypeU32(state),
-		              Binary(state, spv::OpLogicalAnd, TypeBool(state), active,
-		                     Unary(state, spv::OpLogicalNot, TypeBool(state), less)), mid, high);
-	}
-	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), low, count);
-	const auto entry = entry_at(Select(state, TypeU32(state), in_range, low, ConstantU32(state, 0u)));
-	const auto match = Binary(state, spv::OpLogicalAnd, TypeBool(state), in_range,
-	                          Binary(state, spv::OpIEqual, TypeBool(state), LoadMapping(entry), key));
-	const auto resource = LoadMapping(Binary(state, spv::OpIAdd, TypeU32(state), entry,
-	                                         ConstantU32(state, 1u)));
-	return Select(state, TypeU32(state), match, resource, ConstantU32(state, default_resource));
-}
-
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
@@ -100,15 +45,6 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 		                             "buffer specialization is missing");
 	}
 	return state.program.info.buffers[mem.resource].descriptor_format;
-}
-
-uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryInfo& mem) {
-	if (!mem.formatted) return mem.data_bits;
-	const auto format = mem.typed ? Format::DecodeTBufferFormat(mem.data_format, mem.number_format)
-	                              : program.info.buffers[mem.resource].descriptor_format;
-	const auto info = Format::GetFormatInfo(format);
-	return info.type == Format::ComponentType::Unknown || info.packed_bitfield
-	           ? 32u : info.component_bits[0];
 }
 
 void EmitMemoryOffsets(EmitterState& state) {
@@ -131,8 +67,8 @@ void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
 	}
-	if (state.lds_storage_class != spv::StorageClassWorkgroup) {
-		EXIT("LDS backing was not prepared before SPIR-V function emission\n");
+	if (ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
+		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
 	const auto define = [&](uint32_t type, uint32_t bytes) {
 		const auto array = state.builder.DecoratedType(
@@ -148,7 +84,7 @@ void EnsureLdsStorage(EmitterState& state) {
 	};
 	if (state.requirements.shared_int64_atomics) {
 		state.lds_variable = define(TypeU32(state), 4u);
-		state.lds_u64_variable = define(TypeU64(state), 8u);
+		state.lds_u64_variable = define(TypeScalarU64(state), 8u);
 		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
 	} else {
 		state.lds_variable = state.builder.DefineGlobalVariable(
@@ -213,18 +149,24 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
-			const auto bits = mem.kind == IR::ResourceKind::Buffer
-			                      ? StorageBufferElementBits(state.program, mem) : 32u;
-			const auto variable = bits == 8u ? state.storage_buffer_u8_variable
-			                      : bits == 16u ? state.storage_buffer_u16_variable
-			                                    : state.storage_buffer_variable;
 			access = PrepareStorageBufferResourceAccess(
-			    state, mem, variable, TypeStorageBufferPointer(state, bits));
-			access.element_bits = bits;
+			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
+			access.index_offset = EmitBinaryU32(state, spv::OpShiftRightLogical, access.byte_offset,
+			                                    ConstantU32(state, 2u));
+			access.add_index_offset = true;
 			return access;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
 	}
+	access.length = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
+	                          access.object_pointer, 0);
+	return access;
+}
+
+uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
+                                uint32_t raw_index) {
+	return access.add_index_offset ? EmitAddU32(state, raw_index, access.index_offset) : raw_index;
 }
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
@@ -237,14 +179,12 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
-		const auto storage_class = access.kind == IR::ResourceKind::Scratch
-		                               ? spv::StorageClassFunction : state.lds_storage_class;
-		if (storage_class == spv::StorageClassStorageBuffer) {
-			return EmitStorageBufferElementPointer(
-			    state, access, EmitAddU32(state, state.lds_base_dwords, index),
-			    TypeStorageBufferElementPointer(state, 32));
-		}
 		const auto pointer = state.builder.AllocateId();
+		const auto storage_class =
+		    access.kind == IR::ResourceKind::Scratch ? spv::StorageClassFunction
+		    : ShaderWorkgroupInput(state.program.stage, state.input_info) != nullptr
+		        ? spv::StorageClassWorkgroup
+		        : spv::StorageClassFunction;
 		if (access.kind == IR::ResourceKind::Lds && state.requirements.shared_int64_atomics) {
 			state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
 			                          pointer, access.object_pointer, ConstantU32(state, 0), index);
@@ -255,7 +195,7 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 		return pointer;
 	}
 	return EmitStorageBufferElementPointer(state, access, index,
-	                                       TypeStorageBufferElementPointer(state, access.element_bits));
+	                                       TypeStorageBufferElementPointer(state));
 }
 
 uint32_t EmitStorageBufferElementPointer(EmitterState& state,
@@ -366,91 +306,153 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 	}
 }
 
-spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
-	switch (opcode) {
-		case IR::ValueOpcode::ImageAtomicCompareSwap32:
-		case IR::ValueOpcode::BufferAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
-		case IR::ValueOpcode::ImageAtomicSwap32:
-		case IR::ValueOpcode::ImageAtomicSwap64:
-		case IR::ValueOpcode::BufferAtomicSwap32:
-		case IR::ValueOpcode::BufferAtomicSwap64:
-		case IR::ValueOpcode::SharedAtomicSwap32: return spv::OpAtomicExchange;
-		case IR::ValueOpcode::ImageAtomicIAdd32:
-		case IR::ValueOpcode::ImageAtomicIAdd64:
-		case IR::ValueOpcode::BufferAtomicIAdd32:
-		case IR::ValueOpcode::SharedAtomicIAdd64:
-		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
-		case IR::ValueOpcode::BufferAtomicISub32:
-		case IR::ValueOpcode::SharedAtomicISub32: return spv::OpAtomicISub;
-		case IR::ValueOpcode::ImageAtomicSMin32:
-		case IR::ValueOpcode::BufferAtomicSMin32:
-		case IR::ValueOpcode::SharedAtomicSMin32: return spv::OpAtomicSMin;
-		case IR::ValueOpcode::ImageAtomicUMin32:
-		case IR::ValueOpcode::ImageAtomicUMin64:
-		case IR::ValueOpcode::BufferAtomicUMin32:
-		case IR::ValueOpcode::SharedAtomicUMin32: return spv::OpAtomicUMin;
-		case IR::ValueOpcode::ImageAtomicSMax32:
-		case IR::ValueOpcode::BufferAtomicSMax32:
-		case IR::ValueOpcode::SharedAtomicSMax32: return spv::OpAtomicSMax;
-		case IR::ValueOpcode::ImageAtomicUMax32:
-		case IR::ValueOpcode::ImageAtomicUMax64:
-		case IR::ValueOpcode::BufferAtomicUMax32:
-		case IR::ValueOpcode::SharedAtomicUMax32: return spv::OpAtomicUMax;
-		case IR::ValueOpcode::ImageAtomicAnd32:
-		case IR::ValueOpcode::ImageAtomicAnd64:
-		case IR::ValueOpcode::BufferAtomicAnd32:
-		case IR::ValueOpcode::BufferAtomicAnd64:
-		case IR::ValueOpcode::SharedAtomicAnd32: return spv::OpAtomicAnd;
-		case IR::ValueOpcode::ImageAtomicOr32:
-		case IR::ValueOpcode::ImageAtomicOr64:
-		case IR::ValueOpcode::BufferAtomicOr32:
-		case IR::ValueOpcode::BufferAtomicOr64:
-		case IR::ValueOpcode::SharedAtomicOr64:
-		case IR::ValueOpcode::SharedAtomicOr32: return spv::OpAtomicOr;
-		case IR::ValueOpcode::ImageAtomicXor32:
-		case IR::ValueOpcode::ImageAtomicXor64:
-		case IR::ValueOpcode::BufferAtomicXor32:
-		case IR::ValueOpcode::SharedAtomicXor32: return spv::OpAtomicXor;
-		default: return spv::OpNop;
-	}
+static uint32_t EmitSelectU32(EmitterState& state, uint32_t condition, uint32_t true_value,
+                              uint32_t false_value) {
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), ret, condition, true_value,
+	                          false_value);
+	return ret;
 }
 
-uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
-                             uint32_t scope) {
-	const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
-	const auto old    = ctx.state.builder.AllocateId();
-	const bool wide   = inst.GetType() == IR::Type::U64;
-	const auto type   = wide ? TypeU64(ctx.state) : TypeU32(ctx.state);
-	if (opcode == spv::OpAtomicCompareExchange) {
-		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
-		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
-		ctx.state.builder.AddFunction(
-		    spv::OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
-		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
-		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
-	} else {
-		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-		ctx.state.builder.AddFunction(opcode, type, old, pointer,
-		                              ConstantU32(ctx.state, scope),
-		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
-	}
-	return old;
+static uint32_t EmitFormatClampF32(EmitterState& state, uint32_t raw, float low, float high) {
+	const auto value  = EmitBitcastU32ToF32(state, raw);
+	const auto is_nan = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIsNan, TypeBool(state), is_nan, value);
+	const auto finite  = EmitTBufferSelectF32(state, is_nan, ConstantF32Value(state, 0.0f), value);
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+	                          GLSLstd450FClamp, finite, ConstantF32Value(state, low),
+	                          ConstantF32Value(state, high));
+	return clamped;
 }
 
-void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
-	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
-	const auto memory = [&] {
-		switch (kind) {
-			case IR::ResourceKind::Lds:
-				return state.lds_storage_class == spv::StorageClassStorageBuffer
-				           ? spv::MemorySemanticsUniformMemoryMask
-				           : spv::MemorySemanticsWorkgroupMemoryMask;
-			case IR::ResourceKind::Image: return spv::MemorySemanticsImageMemoryMask;
-			default: return spv::MemorySemanticsUniformMemoryMask;
+static uint32_t EmitScaledRoundEven(EmitterState& state, uint32_t value, float scale) {
+	const auto scaled = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFMul, TypeF32(state), scaled, value,
+	                          ConstantF32Value(state, scale));
+	const auto rounded = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state),
+	                          GLSLstd450RoundEven, scaled);
+	return rounded;
+}
+
+static uint32_t EmitF32ToU32(EmitterState& state, uint32_t value) {
+	const auto ret = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), ret, value);
+	return ret;
+}
+
+static uint32_t EmitF32ToI32Bits(EmitterState& state, uint32_t value, uint32_t mask) {
+	const auto converted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), converted, value);
+	const auto bits = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, converted);
+	return EmitBinaryU32(state, spv::OpBitwiseAnd, bits, ConstantU32(state, mask));
+}
+
+static uint32_t EmitF32ToHalfBits(EmitterState& state, uint32_t raw) {
+	const auto value = EmitBitcastU32ToF32(state, raw);
+	const auto pair  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, value,
+	                          ConstantF32Value(state, 0.0f));
+	const auto packed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), packed, GlslStd450(state),
+	                          GLSLstd450PackHalf2x16, pair);
+	return EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0xffffu));
+}
+
+static uint32_t EmitF32ToUFloatBits(EmitterState& state, uint32_t raw, uint32_t bits) {
+	const auto mantissa_bits = bits == 11u ? 6u : 5u;
+	const auto shift         = 23u - mantissa_bits;
+	const auto infinity      = 31u << mantissa_bits;
+	const auto exponent      = EmitBinaryU32(
+        state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, raw, ConstantU32(state, 23)),
+        ConstantU32(state, 0xffu));
+	const auto half_ulp = EmitBinaryU32(
+	    state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, raw, ConstantU32(state, shift)),
+	    ConstantU32(state, 1u));
+	const auto biased = EmitAddU32(
+	    state, EmitAddU32(state, raw, ConstantU32(state, (1u << (shift - 1u)) - 1u)), half_ulp);
+	const auto normal = EmitBinaryU32(
+	    state, spv::OpISub, EmitBinaryU32(state, spv::OpShiftRightLogical, biased, ConstantU32(state, shift)),
+	    ConstantU32(state, 112u << mantissa_bits));
+	const auto normal_clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), normal_clamped, GlslStd450(state),
+	                          GLSLstd450UMin, normal, ConstantU32(state, infinity));
+	const auto value    = EmitBitcastU32ToF32(state, raw);
+	const auto denormal = EmitF32ToU32(
+	    state, EmitScaledRoundEven(state, value,
+	                               std::ldexp(1.0f, static_cast<int>(14u + mantissa_bits))));
+	const auto is_nan = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIsNan, TypeBool(state), is_nan, value);
+	const auto sign     = EmitBinaryU32(state, spv::OpBitwiseAnd, raw, ConstantU32(state, 0x80000000u));
+	const auto negative = EmitCompareU32Constant(state, spv::OpINotEqual, sign, 0);
+	const auto special  = EmitCompareU32Constant(state, spv::OpIEqual, exponent, 255);
+	const auto small    = EmitCompareU32Constant(state, spv::OpULessThan, exponent, 113);
+	const auto finite   = EmitSelectU32(state, small, denormal, normal_clamped);
+	const auto positive = EmitSelectU32(state, special, ConstantU32(state, infinity), finite);
+	const auto numeric  = EmitSelectU32(state, negative, ConstantU32(state, 0), positive);
+	return EmitSelectU32(state, is_nan,
+	                     ConstantU32(state, infinity | (1u << (mantissa_bits - 1u))), numeric);
+}
+
+uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                             uint32_t component, uint32_t raw) {
+	const auto bits = info.component_bits[component];
+	if (bits == 32u) {
+		return raw;
+	}
+	const auto max_unsigned = (1u << bits) - 1u;
+	const auto max_signed   = static_cast<int32_t>((1u << (bits - 1u)) - 1u);
+	switch (info.type) {
+		case Format::ComponentType::Uint: {
+			const auto ret = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpExtInst, TypeU32(state), ret, GlslStd450(state),
+			                          GLSLstd450UMin, raw, ConstantU32(state, max_unsigned));
+			return ret;
 		}
-	}();
-	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope),
-	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+		case Format::ComponentType::Sint: {
+			const auto clamped = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpExtInst, TypeI32(state), clamped, GlslStd450(state),
+			                          GLSLstd450SClamp, EmitTBufferBitcastU32ToI32(state, raw),
+			                          ConstantI32(state, -max_signed - 1),
+			                          ConstantI32(state, max_signed));
+			const auto clamped_bits = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, TypeU32(state), clamped_bits, clamped);
+			return EmitBinaryU32(state, spv::OpBitwiseAnd, clamped_bits,
+			                     ConstantU32(state, max_unsigned));
+		}
+		case Format::ComponentType::Unorm:
+			return EmitF32ToU32(
+			    state, EmitScaledRoundEven(state, EmitFormatClampF32(state, raw, 0.0f, 1.0f),
+			                               static_cast<float>(max_unsigned)));
+		case Format::ComponentType::Snorm:
+			return EmitF32ToI32Bits(
+			    state,
+			    EmitScaledRoundEven(state, EmitFormatClampF32(state, raw, -1.0f, 1.0f),
+			                        static_cast<float>(max_signed)),
+			    max_unsigned);
+		case Format::ComponentType::Uscaled:
+			return EmitF32ToU32(
+			    state, EmitFormatClampF32(state, raw, 0.0f, static_cast<float>(max_unsigned)));
+		case Format::ComponentType::Sscaled:
+			return EmitF32ToI32Bits(state,
+			                        EmitFormatClampF32(state, raw,
+			                                           static_cast<float>(-max_signed - 1),
+			                                           static_cast<float>(max_signed)),
+			                        max_unsigned);
+		case Format::ComponentType::Float:
+			return bits == 16u ? EmitF32ToHalfBits(state, raw)
+			                   : EmitF32ToUFloatBits(state, raw, bits);
+		default: return raw;
+	}
+}
+
+void EmitDeviceAtomicMemoryBarrier(EmitterState& state) {
+	const auto semantics =
+	    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask;
+	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, semantics));
 }
 
 namespace {

@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <span>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -1444,7 +1445,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd,
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t addr = 0x%016" PRIx64 "\n"
 		     "\t cmd  = 0x%016" PRIx64 "\n"
 		     "\t type = %d\n",
@@ -1468,7 +1469,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	const bool                   should_log = (log_count.fetch_add(1) < 64);
+	const bool                   should_log = (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64);
 	if (should_log) {
 		LOGF("\t range = 0x%016" PRIx64 "\n"
 		     "\t cmd   = 0x%016" PRIx64 "\n"
@@ -1552,7 +1553,7 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 	PRINT_NAME();
 
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().SuspendPoint();
+	g_renderer->GetGpu().Done();
 
 	return OK;
 }
@@ -1756,7 +1757,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t thread_group_x = %" PRIu32 "\n"
 		     "\t thread_group_y = %" PRIu32 "\n"
 		     "\t thread_group_z = %" PRIu32 "\n"
@@ -1848,7 +1849,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t buf        = 0x%016" PRIx64 "\n"
 		     "\t offset     = %" PRIx32 "\n"
 		     "\t values     = 0x%016" PRIx64 "\n"
@@ -1904,7 +1905,17 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                
 
 	buf->DbgDump();
 
-	std::vector<ShaderRegister> local_regs(num_regs);
+	// The copy guards against regs aliasing the command memory written below; short lists (the
+	// common case, called ~75k times per second) stay on the stack.
+	std::array<ShaderRegister, 64>  inline_regs {};
+	std::vector<ShaderRegister>     heap_regs;
+	std::span<ShaderRegister>       local_regs;
+	if (num_regs <= inline_regs.size()) {
+		local_regs = std::span<ShaderRegister>(inline_regs.data(), num_regs);
+	} else {
+		heap_regs.resize(num_regs);
+		local_regs = heap_regs;
+	}
 	for (uint32_t i = 0; i < num_regs; i++) {
 		local_regs[i].offset = regs[i].offset;
 		local_regs[i].value  = regs[i].value;
@@ -2039,7 +2050,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t action           = 0x%02" PRIx8 "\n"
 		     "\t gcr_cntl         = 0x%04" PRIx16 "\n"
 		     "\t dst              = %" PRIu8 "\n"
@@ -2388,12 +2399,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*             
 	return cmd;
 }
 
-uint64_t KYTY_SYSV_ABI AgcDcbSetShRegistersIndirectGetSize() {
-	PRINT_NAME();
-
-	return 5u * sizeof(uint32_t);
-}
-
 uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs) {
@@ -2535,6 +2540,7 @@ static uint64_t decode_indirect_modifier_patch_offsets(uint64_t modifier, bool i
 	if (indexed && (low & 0x2u) != 0) {
 		base_vtx_loc |= static_cast<uint64_t>(sgpr_base + extract_modifier_bits(low, 14u, 5u))
 		                << 16u;
+		base_vtx_loc |= 1ull << 59u;
 	}
 
 	return base_vtx_loc | (start_inst_loc << 32u);
@@ -2792,15 +2798,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	// Single indexed draws store the index-offset enable in word 3, bit 28.
-	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true) |
-	                           ((modifier & 0x2ull) << 59u);
+	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true);
 
 	cmd[0] = KYTY_PM4(5, Pm4::IT_DRAW_INDEX_INDIRECT, 0u);
 	cmd[1] = data_offset_in_bytes;
 	cmd[2] = static_cast<uint32_t>(patch_offsets);
 	cmd[3] = static_cast<uint32_t>(patch_offsets >> 32u);
-	cmd[4] = decode_draw_index_initiator(modifier);
+	cmd[4] = decode_indirect_draw_initiator(modifier);
 
 	return cmd;
 }
@@ -2921,30 +2925,19 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	const auto low           = static_cast<uint32_t>(modifier);
-	const auto sgpr_base     = indirect_modifier_sgpr_base(low);
 	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true);
 	const auto count_vaddr   = reinterpret_cast<uint64_t>(count_addr);
-
-	uint32_t draw_index_location = 0x280u;
-	if ((low & 0x8u) != 0) {
-		draw_index_location = sgpr_base + extract_modifier_bits(low, 24u, 5u);
-	}
-	// Multi indexed draws store the index-offset enable in word 4, bit 28.
-	const auto draw_control = draw_index_location | ((low & 0x10u) << 23u) |
-	                          ((low & 0x2u) << 27u) | ((count_indirect & 0x1u) << 30u) |
-	                          ((low & 0x8u) << 28u);
 
 	cmd[0] = KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0u);
 	cmd[1] = data_offset_in_bytes;
 	cmd[2] = static_cast<uint32_t>(patch_offsets);
 	cmd[3] = static_cast<uint32_t>(patch_offsets >> 32u);
-	cmd[4] = draw_control;
+	cmd[4] = (count_indirect & 1u) << 30u;
 	cmd[5] = max_count_or_count;
 	cmd[6] = static_cast<uint32_t>(count_vaddr) & ~0x3u;
 	cmd[7] = static_cast<uint32_t>(count_vaddr >> 32u);
 	cmd[8] = stride_in_bytes;
-	cmd[9] = decode_draw_index_initiator(modifier);
+	cmd[9] = decode_indirect_draw_initiator(modifier);
 
 	return cmd;
 }
@@ -2989,7 +2982,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t event_type = 0x%02" PRIx8 "\n"
 		     "\t address    = 0x%016" PRIx64 "\n",
 		     event_type, reinterpret_cast<uint64_t>(address));
@@ -3052,7 +3045,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	PRINT_NAME();
 
 	static std::atomic<uint32_t> log_count {0};
-	if (log_count.fetch_add(1) < 64) {
+	if (log_count.load(std::memory_order_relaxed) < 64 && log_count.fetch_add(1) < 64) {
 		LOGF("\t engine      = 0x%02" PRIx8 "\n"
 		     "\t cb_db_op    = 0x%08" PRIx32 "\n"
 		     "\t gcr_cntl    = 0x%08" PRIx32 "\n"
@@ -3068,7 +3061,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
 	static std::atomic<uint32_t> warning_log_count {0};
-	const bool                   log_warning = (warning_log_count.fetch_add(1) < 64);
+	const bool                   log_warning = (warning_log_count.load(std::memory_order_relaxed) < 64 && warning_log_count.fetch_add(1) < 64);
 	if (!no_size && (size_bytes & 0xffu) != 0) {
 		if (log_warning) {
 			LOGF_COLOR(Log::Color::Red, "\t warning: size_bytes is not 256-byte aligned\n");
@@ -3215,14 +3208,6 @@ uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
 
 uint32_t KYTY_SYSV_ABI AgcAcbJumpGetSize() {
 	return 0x10u;
-}
-
-uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, uint8_t offload) {
-	auto* cmd = AgcDcbRewind(buf, initial_state);
-	if (cmd != nullptr) {
-		cmd[1] |= (static_cast<uint32_t>(offload & 0x1u) << 24u);
-	}
-	return cmd;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,

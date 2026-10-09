@@ -1,11 +1,11 @@
 #include "mainDialog.h"
 
-#include "cheatFile.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
 #include "controllerLightbar.h"
 #include "gameContent.h"
+#include "patchesDialog.h"
 #include "updateChecker.h"
 
 #include <QApplication>
@@ -234,6 +234,14 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
+	args << "--audio-master-volume" << QString::number(info.audio_mix.master);
+	args << "--audio-main-volume" << QString::number(info.audio_mix.main);
+	args << "--audio-music-volume" << QString::number(info.audio_mix.music);
+	args << "--audio-pad-speaker-volume" << QString::number(info.audio_mix.pad_speaker);
+	if (info.gpu_occlusion_accurate) {
+		// Overrides the bundled preset's KYTY_GPU_OCCLUSION (performance mode by default).
+		args << "--gpu-occlusion" << "on";
+	}
 	args << "--present-mode" << EnumToText(info.present_mode);
 	args << "--dlss" << EnumToText(info.dlss_mode);
 	args << "--upscale-backend" << EnumToText(info.upscale_backend);
@@ -254,9 +262,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--hide-cursor";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
-	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
-	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}
@@ -267,6 +273,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
 	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);
 	args << "--shader-log-folder" << info.shader_log_folder;
+	if (qEnvironmentVariable("KYTY_CAPTURE_SHADER_DETAILS") == QStringLiteral("1")) {
+		args << "--graphics-debug-dump" << "true";
+	}
 	args << "--command-buffer-dump" << BoolArg(info.command_buffer_dump_enabled);
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
 	args << "--printf-direction" << EnumToText(info.printf_direction);
@@ -296,7 +305,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--game" << game;
 
-	const auto patch_plan = Cheats::PlanPath(info.title_id);
+	const auto patch_plan = PatchesDialog::PatchPlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
 		args << "--game-patch" << patch_plan;
 	}

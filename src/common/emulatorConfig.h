@@ -43,6 +43,11 @@ constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
 constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
 constexpr int32_t DEFAULT_USER_ID           = 1000;
+constexpr uint32_t MAX_AUDIO_VOLUME         = 200;
+// Astro Bot sends a lot of its sound to the DualSense speaker (PADSPK); played on the main output
+// it measured up to ~19 dB above the main mix (2026-10-06). The console speaker is small, so it
+// is turned down (30% = -10.5 dB) when no DualSense plays it.
+constexpr uint32_t DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME = 30;
 
 constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 	constexpr int32_t USER_ID_EVERYONE = 0xfe;
@@ -59,6 +64,11 @@ struct ConfigOptions {
 	std::optional<ControllerColor> controller_color;
 	uint32_t               controller_speaker_volume      = 50;
 	uint32_t               controller_vibration_intensity = 100;
+	// Host mix levels in percent (0-200, 100 = unity); see libs/audioMix.h.
+	uint32_t               audio_master_volume            = 100;
+	uint32_t               audio_main_volume              = 100;
+	uint32_t               audio_music_volume             = 100;
+	uint32_t               audio_pad_speaker_main_volume  = DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	DlssMode                       dlss_mode                      = DlssMode::Off;
 	UpscaleBackend                 upscale_backend                = UpscaleBackend::Native;
@@ -91,11 +101,9 @@ struct ConfigOptions {
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
-	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
-	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -112,6 +120,10 @@ const std::string& GetAudioInputDevice();
 const std::optional<ControllerColor>& GetControllerColor();
 uint32_t GetControllerSpeakerVolume();
 uint32_t GetControllerVibrationIntensity();
+uint32_t GetAudioMasterVolume();
+uint32_t GetAudioMainVolume();
+uint32_t GetAudioMusicVolume();
+uint32_t GetAudioPadSpeakerOnMainVolume();
 PresentMode GetPresentMode();
 DlssMode                              GetDlssMode();
 UpscaleBackend                        GetUpscaleBackend();
@@ -153,11 +165,9 @@ bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
-bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool TrophyEnabled();
 bool PlayGoHackEnabled();
-bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

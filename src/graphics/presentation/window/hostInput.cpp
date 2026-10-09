@@ -1,9 +1,11 @@
 #include "graphics/presentation/window/hostInput.h"
+#include "graphics/presentation/window/hostInputPulse.h"
 
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/hostInputTrace.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
 
@@ -18,6 +20,10 @@
 namespace Libs::Graphics {
 
 namespace {
+
+HostInputPulse g_input_pulse;
+
+void ApplyHostKey(int key_code, bool down);
 
 struct ControlInfo {
 	std::string_view name;
@@ -337,6 +343,16 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	}
 }
 
+void ApplyHostKey(int key_code, bool down) {
+	Common::HostInputTrace("apply-key", key_code, down);
+	const auto& map = GetInputMap();
+	if (map.Custom()) {
+		SetControl(map.FindKey(key_code), down);
+	} else {
+		DefaultKeyboardInput(key_code, down);
+	}
+}
+
 void MouseToJoystick(float delta_x, float delta_y) {
 	const double distance = std::hypot(delta_x, delta_y);
 	const double scale =
@@ -404,12 +420,21 @@ bool IsCursorActivity(const SDL_Event& event) {
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
 	g_mouse_window = window;
+	if (const char* value = std::getenv("KYTY_HOST_INPUT_MIN_PRESS_MS")) {
+		char* end = nullptr;
+		const long ms = std::strtol(value, &end, 10);
+		if (end != value && *end == '\0' && ms >= 0 && ms <= 2000) {
+			g_input_pulse.SetMinimum(static_cast<uint64_t>(ms));
+			LOGF("Host input minimum press: %ld ms (test mode)\n", ms);
+		}
+	}
 	if (Config::HideCursorEnabled()) {
 		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
 	}
 }
 
 void HostInputShutdown() {
+	g_input_pulse.ReleaseAll(ApplyHostKey);
 	if (g_mouse.enabled) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();
@@ -423,12 +448,8 @@ void HostInputShutdown() {
 }
 
 void HostInputKey(int key_code, bool down) {
-	const auto& map = GetInputMap();
-	if (map.Custom()) {
-		SetControl(map.FindKey(key_code), down);
-	} else {
-		DefaultKeyboardInput(key_code, down);
-	}
+	Common::HostInputTrace("host-key", key_code, down);
+	g_input_pulse.Key(key_code, down, SDL_GetTicks(), ApplyHostKey);
 }
 
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
@@ -454,8 +475,9 @@ void HostInputToggleMouseToJoystick() {
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
-bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
-	int timeout = -1;
+bool HostInputWaitEvent(SDL_Event* event) {
+	// -1 waits without a deadline.
+	int timeout = g_input_pulse.Poll(SDL_GetTicks(), ApplyHostKey);
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
@@ -464,7 +486,8 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 			SDL_GetRelativeMouseState(nullptr, nullptr);
 			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
 		}
-		timeout = PollMouse(SDL_GetTicks());
+		const int mouse_wait = PollMouse(SDL_GetTicks());
+		timeout              = timeout < 0 ? mouse_wait : std::min(timeout, mouse_wait);
 	}
 
 	if (g_cursor_hide_at != 0) {
@@ -473,8 +496,10 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
 		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
 	}
-	timeout              = timeout < 0 ? max_wait_ms : std::min(timeout, max_wait_ms);
 	const bool has_event = SDL_WaitEventTimeout(event, timeout);
+	if (!has_event && timeout < 0) {
+		EXIT("%s\n", SDL_GetError());
+	}
 
 	if (Config::HideCursorEnabled()) {
 		const auto now_ms = SDL_GetTicks();
@@ -490,6 +515,8 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 
 	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&
 	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {
+		Common::HostInputTrace("focus-lost", 0, 0);
+		g_input_pulse.ReleaseAll(ApplyHostKey);
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
 	}

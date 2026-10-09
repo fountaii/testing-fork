@@ -21,6 +21,7 @@ constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
     {0x04u, Opcode::S_LOAD_DWORDX16, 16, 32},      {0x08u, Opcode::S_BUFFER_LOAD_DWORD, 1, 32},
     {0x09u, Opcode::S_BUFFER_LOAD_DWORDX2, 2, 32}, {0x0au, Opcode::S_BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0bu, Opcode::S_BUFFER_LOAD_DWORDX8, 8, 32}, {0x0cu, Opcode::S_BUFFER_LOAD_DWORDX16, 16, 32},
+    {0x1fu, Opcode::S_GL1_INV, 0, 32},             {0x20u, Opcode::S_DCACHE_INV, 0, 32},
     {0x25u, Opcode::S_MEMREALTIME, 2, 32},
 };
 
@@ -58,13 +59,23 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x39u, Opcode::BUFFER_ATOMIC_AND, 1, 32},
     {0x3au, Opcode::BUFFER_ATOMIC_OR, 1, 32},
     {0x3bu, Opcode::BUFFER_ATOMIC_XOR, 1, 32},
+    {0x3cu, Opcode::BUFFER_ATOMIC_INC, 1, 32},
+    {0x3du, Opcode::BUFFER_ATOMIC_DEC, 1, 32},
     {0x3fu, Opcode::BUFFER_ATOMIC_FMIN, 1, 32},
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
+    {0x51u, Opcode::BUFFER_ATOMIC_CMPSWAP_X2, 2, 32},
+    {0x52u, Opcode::BUFFER_ATOMIC_ADD_X2, 2, 32},
+    {0x53u, Opcode::BUFFER_ATOMIC_SUB_X2, 2, 32},
+    {0x55u, Opcode::BUFFER_ATOMIC_SMIN_X2, 2, 32},
+    {0x56u, Opcode::BUFFER_ATOMIC_UMIN_X2, 2, 32},
+    {0x57u, Opcode::BUFFER_ATOMIC_SMAX_X2, 2, 32},
+    {0x58u, Opcode::BUFFER_ATOMIC_UMAX_X2, 2, 32},
     {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
-    {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true},
-    {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
+    {0x5bu, Opcode::BUFFER_ATOMIC_XOR_X2, 2, 32},
+    {0x71u, Opcode::BUFFER_GL0_INV, 0, 32},
+    {0x72u, Opcode::BUFFER_GL1_INV, 0, 32},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -111,7 +122,6 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x39u, Opcode::DS_READ_I8, 1, 8, true},     {0x3au, Opcode::DS_READ_U8, 1, 8},
     {0x3bu, Opcode::DS_READ_I16, 1, 16, true},   {0x3cu, Opcode::DS_READ_U16, 1, 16},
     {0x3du, Opcode::DS_CONSUME, 1, 32},          {0x3eu, Opcode::DS_APPEND, 1, 32},
-    {0x3fu, Opcode::DS_ORDERED_COUNT, 1, 32},
     {0x40u, Opcode::DS_ADD_U64, 2, 32},         {0x4au, Opcode::DS_OR_B64, 2, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
@@ -217,7 +227,6 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_READ_ADDTID_B32:
 		case Opcode::DS_CONSUME:
 		case Opcode::DS_APPEND: return 0u;
-		case Opcode::DS_ORDERED_COUNT: return 1u;
 		default: return IsDsWriteOpcode(opcode) || IsDsAtomicOpcode(opcode) ? 2u : 1u;
 	}
 }
@@ -263,6 +272,12 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.src_count = 0;
 		return;
 	}
+	if (inst.opcode == Opcode::S_DCACHE_INV || inst.opcode == Opcode::S_GL1_INV) {
+		// Cache invalidations have no operands; host memory is coherent at this level.
+		inst.dst.kind  = OperandKind::Null;
+		inst.src_count = 0;
+		return;
+	}
 	// SMEM encodes SBASE in SGPR pairs. Scalar-buffer loads still use the same
 	// pair index; their descriptor operand consumes four SGPRs from that base.
 	DecodeScalarSource(sbase * 2u, pc, inst.src0);
@@ -288,6 +303,7 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.glc         = ((word0 >> 14u) & 1u) != 0;
 	inst.dlc         = ((word0 >> 15u) & 1u) != 0;
 	inst.slc         = ((word1 >> 22u) & 1u) != 0;
+	inst.tfe         = ((word1 >> 23u) & 1u) != 0;
 	inst.family      = Family::MUBUF;
 	inst.opcode_id   = opcode;
 	const auto* info = Detail::FindOpcode(MUBUF_OPS, opcode);
@@ -296,11 +312,14 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
 	}
+	if (inst.opcode == Opcode::BUFFER_GL0_INV || inst.opcode == Opcode::BUFFER_GL1_INV) {
+		// Cache invalidations ignore every operand field.
+		inst.dst.kind  = OperandKind::Null;
+		inst.src_count = 0;
+		return;
+	}
 
 	DecodeVectorGpr(vdata, inst.dst);
-	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_X) {
-		inst.dst.sdwa_sel = 4u;
-	}
 	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
 	DecodeScalarSource(soffset, pc, inst.src2);
@@ -327,6 +346,7 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.glc           = ((word0 >> 14u) & 1u) != 0;
 	inst.dlc           = ((word0 >> 15u) & 1u) != 0;
 	inst.slc           = ((word1 >> 22u) & 1u) != 0;
+	inst.tfe           = ((word1 >> 23u) & 1u) != 0;
 	inst.family        = Family::MTBUF;
 	inst.opcode_id     = opcode;
 	inst.data_format   = dfmt;
@@ -350,6 +370,7 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t word0  = code[word_index];
 	const uint32_t word1  = code[word_index + 1u];
 	const uint32_t offset = word0 & 0xfffu;
+	const uint32_t dlc    = (word0 >> 12u) & 1u;
 	const uint32_t lds    = (word0 >> 13u) & 1u;
 	const uint32_t seg    = (word0 >> 14u) & 0x3u;
 	const uint32_t opcode = (word0 >> 18u) & 0x7fu;
@@ -361,9 +382,9 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.pc             = pc;
 	inst.word_count     = 2;
 	inst.offset         = seg == 0u ? (offset & 0x7ffu) : SignExtendU32(offset, 12u);
-	inst.dlc            = ((word0 >> 12u) & 1u) != 0;
 	inst.glc            = ((word0 >> 16u) & 1u) != 0;
 	inst.slc            = ((word0 >> 17u) & 1u) != 0;
+	inst.dlc            = dlc != 0u;
 	inst.family         = Family::FLAT;
 	inst.opcode_id      = opcode;
 	inst.memory_segment = seg;
@@ -371,7 +392,9 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	ApplyMemoryInfo(inst, info);
 	SetRawWords(inst, code, word_index, 2);
 
-	if (lds != 0 || inst.glc || inst.slc || seg == 3u) {
+	// GLC/SLC/DLC only select cache policy for loads and stores; the host path accesses
+	// memory coherently, so they are accepted as hints.
+	if (lds != 0 || seg == 3u) {
 		SetUnsupported(inst, Family::FLAT, opcode, "FLAT modifiers or segment are not implemented");
 		return;
 	}
@@ -418,14 +441,6 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	SetRawWords(inst, code, word_index, 2);
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::DS, opcode, "DS opcode is not implemented");
-	}
-	if (inst.opcode == Opcode::DS_ORDERED_COUNT) {
-		// Keep OFFSET1's wave type as well as its add/swap selector for GDS addressing.
-		inst.offset           = offset0 & 0xfcu;
-		inst.secondary_offset = offset1;
-		if (!inst.gds || ((offset1 >> 4u) & 3u) > 1u || ((offset1 >> 6u) & 3u) != 0u) {
-			SetUnsupported(inst, Family::DS, opcode, "DS ordered count variant is not implemented");
-		}
 	}
 	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && inst.offset >= 0xe000u) {
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");

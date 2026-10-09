@@ -11,14 +11,61 @@
 
 #include <charconv>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string_view>
 #include <vector>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 
+#if defined(KYTY_PGO_GENERATE)
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <system_error>
+#include <thread>
+
+// compiler-rt profile runtime (instrumented builds, CMake KYTY_PGO_GENERATE).
+extern "C" void __llvm_profile_set_filename(const char*);
+extern "C" int  __llvm_profile_write_file(void);
+#endif
+
 using namespace Common;
 using namespace Emulator;
+
+#if defined(KYTY_PGO_GENERATE)
+// The profile runtime writes its counters only at a normal exit, but the timing harness stops the
+// emulator with TerminateProcess. With KYTY_PGO_FILE=<file.profraw>, a thread writes them every
+// KYTY_PGO_DUMP_SECONDS (default 20) to <file>.tmp and renames that over <file>, so the file always
+// holds the last complete dump.
+static void StartPgoDumps() {
+	const char* file = std::getenv("KYTY_PGO_FILE");
+	if (file == nullptr || *file == '\0') {
+		::printf("PGO: instrumented build without KYTY_PGO_FILE: no profile is written\n");
+		return;
+	}
+	const char* seconds_text = std::getenv("KYTY_PGO_DUMP_SECONDS");
+	const int   seconds      = (seconds_text != nullptr && std::atoi(seconds_text) > 0) ? std::atoi(seconds_text) : 20;
+	static const std::string target = file;
+	static const std::string temp   = target + ".tmp";
+	::printf("PGO: writing the profile to %s every %d s\n", target.c_str(), seconds);
+	std::thread([seconds]() {
+		for (uint32_t dump = 1;; dump++) {
+			std::this_thread::sleep_for(std::chrono::seconds(seconds));
+			__llvm_profile_set_filename(temp.c_str());
+			const int       written = __llvm_profile_write_file();
+			std::error_code error;
+			if (written == 0) {
+				std::filesystem::rename(temp, target, error);
+			}
+			::printf("PGO: dump %u %s\n", dump, written != 0 ? "failed to write" : (error ? "failed to rename" : "written"));
+			::fflush(stdout);
+		}
+	}).detach();
+}
+#endif
 
 static std::string GetBuildString() {
 	Date date = Date::FromMacros(std::string(__DATE__));
@@ -56,6 +103,12 @@ static void PrintUsage() {
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
 	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
+	::printf("  --audio-master-volume <0-200>       Volume of everything on the main output. Default: 100.\n");
+	::printf("  --audio-main-volume <0-200>         Game sound (main ports). Default: 100.\n");
+	::printf("  --audio-music-volume <0-200>        Music on BGM ports. Default: 100.\n");
+	::printf("  --audio-pad-speaker-volume <0-200>  Controller-speaker sounds played on the main output\n"
+	         "                                      when no DualSense takes them. Default: %u.\n",
+	         Config::DEFAULT_AUDIO_PAD_SPEAKER_MAIN_VOLUME);
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -83,7 +136,9 @@ static void PrintUsage() {
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
-	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
+	::printf("  --amd-cpu                            Intel CPU compatibility: emulate the PS5's AMD-only\n"
+	         "                                       instructions (EXTRQ/INSERTQ, AMD VRSQRTPS results).\n"
+	         "                                       Not needed on AMD CPUs.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
@@ -91,6 +146,9 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --gpu-occlusion <on|off>             Accurate GPU occlusion queries (on) or always visible\n"
+	         "                                       (off, faster). Overrides KYTY_GPU_OCCLUSION (the\n"
+	         "                                       bundled preset: off).\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -104,13 +162,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf(
-	    "  --sync-raw-image-buffers <true|false> Synchronize raw reads of GPU images. Default: false.\n");
-	::printf(
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
-	::printf(
-	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
-	    "                                      Default: false.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -371,6 +424,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid controller vibration intensity: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--audio-master-volume" || arg == "--audio-main-volume" ||
+		           arg == "--audio-music-volume" || arg == "--audio-pad-speaker-volume") {
+			auto& target = arg == "--audio-master-volume" ? options.config.audio_master_volume
+			               : arg == "--audio-main-volume" ? options.config.audio_main_volume
+			               : arg == "--audio-music-volume"
+			                   ? options.config.audio_music_volume
+			                   : options.config.audio_pad_speaker_main_volume;
+			if (!ParseUint32(value, target) || target > Config::MAX_AUDIO_VOLUME) {
+				::printf("invalid %s (expected 0-%u): %s\n", arg.c_str(), Config::MAX_AUDIO_VOLUME,
+				         value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
@@ -438,6 +503,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid console language: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--gpu-occlusion") {
+			bool on = false;
+			if (!ParseBool(value, on)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+			// The renderer reads KYTY_GPU_OCCLUSION once, at the first occlusion query.
+#ifdef _WIN32
+			_putenv_s("KYTY_GPU_OCCLUSION", on ? "1" : "0");
+#else
+			setenv("KYTY_GPU_OCCLUSION", on ? "1" : "0", 1);
+#endif
 		} else if (arg == "--vulkan-validation") {
 			if (!ParseBool(value, options.config.vulkan_validation_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -494,18 +571,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
-		} else if (arg == "--sync-raw-image-buffers") {
-			if (!ParseBool(value, options.config.sync_raw_image_buffers)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
 		} else if (arg == "--trophy-notifications") {
 			if (!ParseBool(value, options.config.trophy_enabled)) {
-				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
-				return false;
-			}
-		} else if (arg == "--skip-notice-screen") {
-			if (!ParseBool(value, options.config.skip_notice_screen)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
@@ -526,12 +593,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		options.config.vulkan_validation_enabled = true;
 	}
 
+	// KYTY_AMD_CPU=1|0 forces the launcher's "AMD CPU patch" (--amd-cpu: guest VRSQRTPS emulated
+	// with an accurate 1/sqrt) on or off, for presets and test harnesses.
+	if (const char* amd_cpu = std::getenv("KYTY_AMD_CPU"); amd_cpu != nullptr && amd_cpu[0] != '\0') {
+		options.config.amd_cpu_enabled = std::strcmp(amd_cpu, "0") != 0;
+	}
+
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
 static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
+#if defined(KYTY_PGO_GENERATE)
+	// After the address-space reservations: the thread's stack must not land in the guest range.
+	StartPgoDumps();
+#endif
 
 	RunOptions options;
 	bool       show_help = false;

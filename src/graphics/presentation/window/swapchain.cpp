@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+#include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -23,6 +24,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <span>
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -302,16 +308,19 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 
 class Swapchain final {
 public:
-	enum class Status : uint8_t { Success, Recreate, SurfaceLost };
+	enum class Status : uint8_t { Success, Recreate, SurfaceLost, Minimized };
 
 	explicit Swapchain(WindowContext& window): m_window(window) {}
 	~Swapchain();
 	KYTY_CLASS_NO_COPY(Swapchain);
 
+	/// Creates the Vulkan swapchain; sets m_minimized when the window or surface extent is zero.
 	void                 Create();
+	/// Destroys then re-creates the swapchain, optionally recreating the Vulkan surface first.
 	void                 Recreate(bool surface_lost = false);
+	/// Returns true when the swapchain must be recreated before the next present.
 	[[nodiscard]] bool   NeedsResize() const;
-	[[nodiscard]] Status AcquireNextImage();
+	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void                 RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                                           const Presenter::Layer& overlay, bool draw_system_overlay,
@@ -323,10 +332,12 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] bool       IsMinimized() const noexcept { return m_minimized; }
 	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
 	[[nodiscard]] vk::Image    CurrentImage() const { return m_images[m_image_index]; }
 
 private:
+	/// Destroys the swapchain Vulkan objects and resets all members.
 	void Destroy();
 	void CreateViews();
 	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
@@ -339,15 +350,23 @@ private:
 	vk::Extent2D     m_extent {};
 	// Drawable pixel size observed when this swapchain was created.
 	vk::Extent2D                   m_window_extent {};
+	bool                           m_minimized         = false;
+	/// True when m_minimized was set because the surface/drawable extent was {0,0} but
+	/// WindowContext::minimized is false (e.g. compositor not ready). Cleared on successful
+	/// swapchain creation or Destroy().
+	bool                           m_surface_extent_zero = false;
+	bool                           m_suboptimal          = false;
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
 	std::vector<vk::Semaphore>     m_render_complete;
+	std::vector<uint64_t>          m_frame_ticks;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
+	PresentFilter                  m_filter; // KYTY_PRESENT_BOX_DOWNSCALE
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
 };
@@ -355,12 +374,13 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx, true), frames(owner, present_scheduler),
+	      present_scheduler(renderer, owner.graphic_ctx, CommandScheduler::Role::Presenter), frames(owner, present_scheduler),
 	      dlss(owner.graphic_ctx, renderer.GetCommandScheduler()),
 	      emulator_inputs(owner.graphic_ctx, renderer.GetCommandScheduler()) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
-		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		const uint32_t image_count = swapchain.ImageCount() > 0 ? swapchain.ImageCount() : 3;
+		frames.Initialize(image_count, swapchain.Format());
 	}
 
 	~Impl() {
@@ -385,7 +405,9 @@ struct Presenter::Impl {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
-		frames.SetFormat(swapchain.Format());
+		if (!swapchain.IsMinimized()) {
+			frames.SetFormat(swapchain.Format());
+		}
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -463,10 +485,44 @@ struct Presenter::Impl {
 	uint64_t              deferred_work = 0; // Interpolation CPU time, for timing only.
 };
 
+/// Creates the Vulkan swapchain for the current window surface.
+/// Sets m_minimized and returns early when the window or surface extent is zero.
+/// Sets m_surface_extent_zero when the early return is due to a zero surface/drawable extent
+/// and WindowContext::minimized is false, so NeedsResize() can poll instead of spinning.
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
 	EXIT_IF(graphics.device == nullptr);
 	EXIT_IF(m_window.surface == nullptr);
+
+	m_window.RefreshSurfaceCapabilities();
+	const auto& surface = m_window.surface_capabilities;
+	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
+
+	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
+	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
+		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
+		                             [](const vk::SurfaceFormatKHR& candidate) {
+			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
+			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
+		                             });
+		if (it == surface.formats.end()) {
+			EXIT("no supported UNORM swapchain format\n");
+		}
+		format = *it;
+	}
+	m_format                      = format.format;
+	const auto swapchain_features = graphics.GetFormatProperties(m_format).optimalTilingFeatures;
+	if (!static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eBlitDst)) {
+		EXIT("swapchain format cannot be a blit destination: format=%d\n",
+		     static_cast<int>(m_format));
+	}
+
+	if (m_window.minimized.load(std::memory_order_acquire)) {
+		// Window is genuinely minimized; m_surface_extent_zero is not the cause.
+		m_minimized           = true;
+		m_surface_extent_zero = false;
+		return;
+	}
 
 	// Capture the size before querying surface capabilities. If the window changes
 	// during creation, the next presentation will detect the newer size.
@@ -474,11 +530,13 @@ void Swapchain::Create() {
 		Common::LockGuard lock(m_window.mutex);
 		m_window_extent = {graphics.screen_width, graphics.screen_height};
 	}
-	EXIT_IF(m_window_extent.width == 0);
-	EXIT_IF(m_window_extent.height == 0);
-	m_window.RefreshSurfaceCapabilities();
-	const auto& surface = m_window.surface_capabilities;
-	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
+	if (m_window_extent.width == 0 || m_window_extent.height == 0) {
+		LOGF("Swapchain::Create(): drawable extent is zero while window is not minimized; "
+		     "waiting for surface to become ready\n");
+		m_minimized           = true;
+		m_surface_extent_zero = true;
+		return;
+	}
 
 	m_extent = surface.capabilities.currentExtent;
 	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
@@ -489,6 +547,18 @@ void Swapchain::Create() {
 		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
 		               surface.capabilities.maxImageExtent.height);
 	}
+	if (m_extent.width == 0 || m_extent.height == 0) {
+		LOGF("Swapchain::Create(): surface currentExtent is zero while window is not minimized; "
+		     "waiting for surface to become ready\n");
+		m_minimized           = true;
+		m_surface_extent_zero = true;
+		return;
+	}
+
+	m_minimized           = false;
+	m_surface_extent_zero = false;
+	m_suboptimal          = false;
+
 	if (auto* fg = m_window.frame_generation.get(); fg && fg->Bridge()) {
 		if (fg->Bridge()->CreateSwapchain(fg->NativeWindow(), m_extent,
 		                                  Config::GetPresentMode() == Config::PresentMode::Fifo)) {
@@ -513,25 +583,6 @@ void Swapchain::Create() {
 	    surface.capabilities.supportedCompositeAlpha & vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
-
-	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
-	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
-		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
-		                             [](const vk::SurfaceFormatKHR& candidate) {
-			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
-			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
-		                             });
-		if (it == surface.formats.end()) {
-			EXIT("no supported UNORM swapchain format\n");
-		}
-		format = *it;
-	}
-	m_format                      = format.format;
-	const auto swapchain_features = graphics.GetFormatProperties(m_format).optimalTilingFeatures;
-	if (!static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eBlitDst)) {
-		EXIT("swapchain format cannot be a blit destination: format=%d\n",
-		     static_cast<int>(m_format));
-	}
 
 	vk::SwapchainCreateInfoKHR create_info {};
 	create_info.sType            = vk::StructureType::eSwapchainCreateInfoKHR;
@@ -578,22 +629,11 @@ void Swapchain::Create() {
 		    return graphics.device.getSwapchainImagesKHR(m_handle, count, images);
 	    });
 	EXIT_NOT_IMPLEMENTED(m_images.empty());
+	// Freeze reports depend on it (RTX 50 PCs froze in Mailbox, not in Fifo).
+	LOGF("Swapchain: %ux%u, %zu images, present mode %s\n", m_extent.width, m_extent.height,
+	     m_images.size(), vk::to_string(create_info.presentMode).c_str());
 	CreateViews();
 
-	vk::SemaphoreCreateInfo semaphore_info {};
-	semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
-	m_image_acquired.resize(m_images.size());
-	m_render_complete.resize(m_images.size());
-	for (size_t i = 0; i < m_images.size(); i++) {
-		RequireVulkanSuccess(
-		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_image_acquired[i]),
-		    "create swapchain image-acquired semaphore");
-		RequireVulkanSuccess(
-		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_render_complete[i]),
-		    "create swapchain render-complete semaphore");
-	}
-	m_image_index = static_cast<uint32_t>(-1);
-	m_frame_index = 0;
 }
 
 void Swapchain::CreateViews() {
@@ -615,13 +655,33 @@ void Swapchain::CreateViews() {
 		                     "vkCreateImageView");
 		EXIT_IF(m_image_views[i] == nullptr);
 	}
+
+	vk::SemaphoreCreateInfo semaphore_info {};
+	semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
+	m_image_acquired.resize(m_images.size());
+	m_render_complete.resize(m_images.size());
+	m_frame_ticks.assign(m_images.size(), 0);
+	for (size_t i = 0; i < m_images.size(); i++) {
+		RequireVulkanSuccess(
+		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_image_acquired[i]),
+		    "create swapchain image-acquired semaphore");
+		RequireVulkanSuccess(
+		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_render_complete[i]),
+		    "create swapchain render-complete semaphore");
+	}
+	m_image_index = static_cast<uint32_t>(-1);
+	m_frame_index = 0;
 }
 
 Swapchain::~Swapchain() {
 	Destroy();
 }
 
+/// Destroys all Vulkan swapchain objects and resets all members to their default state.
 void Swapchain::Destroy() {
+	m_minimized           = false;
+	m_surface_extent_zero = false;
+	m_suboptimal          = false;
 	if (m_handle == nullptr && m_image_acquired.empty() && m_render_complete.empty() &&
 	    m_image_views.empty()) {
 		return;
@@ -630,6 +690,7 @@ void Swapchain::Destroy() {
 
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
+		graphics.submission_queue.DrainPendingLocked();
 		Common::LockGuard present_lock(graphics.present_queue_mutex);
 		if (m_window.frame_generation && m_window.frame_generation->Hooked()) {
 			// Streamline presents on its own queues and pacer thread. Its device
@@ -653,6 +714,7 @@ void Swapchain::Destroy() {
 	m_overlay_layout      = nullptr;
 	m_overlay_descriptors = nullptr;
 	m_overlay_sampler     = nullptr;
+	m_filter.Release(graphics.device);
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
@@ -687,8 +749,10 @@ void Swapchain::Destroy() {
 	m_image_views.clear();
 	m_image_acquired.clear();
 	m_render_complete.clear();
+	m_frame_ticks.clear();
 }
 
+/// Destroys and re-creates the swapchain, optionally recreating the Vulkan surface first.
 void Swapchain::Recreate(bool surface_lost) {
 	Destroy();
 	if (surface_lost) {
@@ -705,18 +769,62 @@ void Swapchain::Recreate(bool surface_lost) {
 	Create();
 }
 
+/// Returns true when the swapchain must be recreated before the next present.
+/// In the m_surface_extent_zero case (compositor not ready, window not minimized) this
+/// re-queries the surface capabilities and only returns true when the extent is usable,
+/// preventing a recreate-every-frame busy-loop.
 bool Swapchain::NeedsResize() const {
+	const bool window_minimized = m_window.minimized.load(std::memory_order_acquire);
+	if (m_minimized) {
+		if (window_minimized) {
+			// OS window is minimized; nothing to do yet.
+			return false;
+		}
+		if (!m_surface_extent_zero) {
+			// Swapchain was marked minimized because WindowContext::minimized was true at
+			// creation time, but it has since been cleared -> recreate now.
+			return true;
+		}
+		// m_surface_extent_zero: the OS window exists but the compositor has not yet
+		// assigned a real extent. Re-query and only trigger a recreate once the extent
+		// is non-zero; otherwise return false to avoid a spinning recreate loop.
+		m_window.RefreshSurfaceCapabilities();
+		const auto& caps   = m_window.surface_capabilities.capabilities;
+		const auto& extent = caps.currentExtent;
+		// Extent 0xFFFFFFFF means the surface size is determined by the swapchain;
+		// in that case read the cached drawable size under the window mutex.
+		if (extent.width == std::numeric_limits<uint32_t>::max()) {
+			Common::LockGuard lock(m_window.mutex);
+			const bool drawable_ready = m_window.graphic_ctx.screen_width > 0 &&
+			                            m_window.graphic_ctx.screen_height > 0;
+			return drawable_ready;
+		}
+		Common::LockGuard lock(m_window.mutex);
+		const bool drawable_ready = m_window.graphic_ctx.screen_width > 0 &&
+		                            m_window.graphic_ctx.screen_height > 0;
+		return drawable_ready && extent.width > 0 && extent.height > 0;
+	}
+	if (window_minimized) {
+		return true;
+	}
 	Common::LockGuard lock(m_window.mutex);
 	return m_window_extent.width != m_window.graphic_ctx.screen_width ||
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
-Swapchain::Status Swapchain::AcquireNextImage() {
+Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
+	if (m_minimized || (m_handle == nullptr && m_bridge == nullptr)) {
+		return Status::Minimized;
+	}
+	EXIT_IF(m_frame_index >= m_image_acquired.size());
+	if (m_frame_index < m_frame_ticks.size() && m_frame_ticks[m_frame_index] != 0) {
+		scheduler.Wait(m_frame_ticks[m_frame_index]);
+		m_frame_ticks[m_frame_index] = 0;
+	}
 	if (m_bridge != nullptr) {
 		m_image_index = m_bridge->Acquire();
 		return Status::Success;
 	}
-	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
@@ -725,7 +833,8 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			m_suboptimal = true;
+			break;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
@@ -746,6 +855,175 @@ bool Swapchain::PrepareSystemOverlay() {
 		m_system_overlay = std::make_unique<SystemOverlay>(m_window.graphic_ctx);
 	}
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
+}
+
+// KYTY_PRESENT_BOX_DOWNSCALE=1: present 1-2x downscales with PresentFilter (windowInternal.h).
+static bool PresentBoxDownscaleEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PRESENT_BOX_DOWNSCALE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+// A pipeline that draws the fullscreen triangle with `fragment_code` into one `format` attachment.
+static vk::Pipeline CreateFullscreenPipeline(vk::Device device, vk::PipelineLayout layout,
+                                             std::span<const uint32_t> fragment_code,
+                                             vk::Format format) {
+	const auto vertex   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, device);
+	const auto fragment = CompileSPV(fragment_code, device);
+	std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
+	stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
+	stages[0].module = vertex;
+	stages[0].pName  = "main";
+	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
+	stages[1].module = fragment;
+	stages[1].pName  = "main";
+	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
+	vk::PipelineInputAssemblyStateCreateInfo assembly {};
+	assembly.topology = vk::PrimitiveTopology::eTriangleList;
+	vk::PipelineViewportStateCreateInfo viewport {};
+	viewport.viewportCount = 1;
+	viewport.scissorCount  = 1;
+	vk::PipelineRasterizationStateCreateInfo rasterization {};
+	rasterization.lineWidth = 1.0f;
+	vk::PipelineMultisampleStateCreateInfo multisample {};
+	multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+	vk::PipelineColorBlendAttachmentState attachment {};
+	attachment.blendEnable    = VK_FALSE;
+	attachment.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+	                            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+	vk::PipelineColorBlendStateCreateInfo blend {};
+	blend.attachmentCount = 1;
+	blend.pAttachments    = &attachment;
+	const std::array dynamic_states {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo dynamic {};
+	dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
+	dynamic.pDynamicStates    = dynamic_states.data();
+	vk::PipelineRenderingCreateInfo rendering {};
+	rendering.colorAttachmentCount    = 1;
+	rendering.pColorAttachmentFormats = &format;
+	vk::GraphicsPipelineCreateInfo create {};
+	create.pNext               = &rendering;
+	create.stageCount          = static_cast<uint32_t>(stages.size());
+	create.pStages             = stages.data();
+	create.pVertexInputState   = &vertex_input;
+	create.pInputAssemblyState = &assembly;
+	create.pViewportState      = &viewport;
+	create.pRasterizationState = &rasterization;
+	create.pMultisampleState   = &multisample;
+	create.pColorBlendState    = &blend;
+	create.pDynamicState       = &dynamic;
+	create.layout              = layout;
+	vk::Pipeline pipeline      = nullptr;
+	RequireVulkanSuccess(device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
+	                     "create video-out downscale pipeline");
+	device.destroyShaderModule(fragment, nullptr);
+	device.destroyShaderModule(vertex, nullptr);
+	return pipeline;
+}
+
+bool PresentNeedsFilter(vk::Extent2D source, vk::Extent2D target) noexcept {
+	const bool shrinks = source.width > target.width || source.height > target.height;
+	const bool halves =
+	    source.width == 2ull * target.width && source.height == 2ull * target.height;
+	return shrinks && !halves && source.width <= 2ull * target.width &&
+	       source.height <= 2ull * target.height;
+}
+
+void PresentFilter::Record(vk::Device device, vk::CommandBuffer command, vk::ImageView source_view,
+                           uint32_t level, vk::Extent2D source, vk::ImageView target_view,
+                           vk::Format target_format, vk::Extent2D target) {
+	struct Constants {
+		int32_t  size[2];
+		float    scale[2];
+		uint32_t level;
+	};
+	static_assert(sizeof(Constants) == 20);
+	if (m_layout == nullptr) {
+		vk::SamplerCreateInfo sampler {};
+		sampler.magFilter    = vk::Filter::eLinear;
+		sampler.minFilter    = vk::Filter::eLinear;
+		sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+		sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+		sampler.maxLod       = VK_LOD_CLAMP_NONE;
+		RequireVulkanSuccess(device.createSampler(&sampler, nullptr, &m_sampler),
+		                     "create video-out downscale sampler");
+		const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eCombinedImageSampler,
+		                                              1, vk::ShaderStageFlagBits::eFragment};
+		vk::DescriptorSetLayoutCreateInfo    descriptors {};
+		descriptors.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		descriptors.bindingCount = 1;
+		descriptors.pBindings    = &binding;
+		RequireVulkanSuccess(device.createDescriptorSetLayout(&descriptors, nullptr, &m_descriptors),
+		                     "create video-out downscale descriptor layout");
+		const vk::PushConstantRange  constants {vk::ShaderStageFlagBits::eFragment, 0,
+		                                        sizeof(Constants)};
+		vk::PipelineLayoutCreateInfo layout {};
+		layout.setLayoutCount         = 1;
+		layout.pSetLayouts            = &m_descriptors;
+		layout.pushConstantRangeCount = 1;
+		layout.pPushConstantRanges    = &constants;
+		RequireVulkanSuccess(device.createPipelineLayout(&layout, nullptr, &m_layout),
+		                     "create video-out downscale pipeline layout");
+	}
+	if (m_pipeline != nullptr && m_format != target_format) {
+		device.destroyPipeline(m_pipeline, nullptr);
+		m_pipeline = nullptr;
+	}
+	if (m_pipeline == nullptr) {
+		m_pipeline = CreateFullscreenPipeline(device, m_layout, GPU_VIDEO_OUT_DOWNSCALE_SPV, target_format);
+		m_format   = target_format;
+	}
+
+	const vk::DescriptorImageInfo image {m_sampler, source_view,
+	                                     vk::ImageLayout::eShaderReadOnlyOptimal};
+	vk::WriteDescriptorSet        write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+	write.pImageInfo      = &image;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_layout, 0, 1, &write);
+	const Constants constants {
+	    {static_cast<int32_t>(source.width), static_cast<int32_t>(source.height)},
+	    {static_cast<float>(source.width) / static_cast<float>(target.width),
+	     static_cast<float>(source.height) / static_cast<float>(target.height)},
+	    level};
+	command.pushConstants(m_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants),
+	                      &constants);
+	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_pipeline);
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = target_view;
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eDontCare;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = target;
+	rendering.layerCount           = 1;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	command.beginRendering(&rendering);
+	const vk::Viewport viewport {
+	    0.0f, 0.0f, static_cast<float>(target.width), static_cast<float>(target.height), 0.0f, 1.0f};
+	const vk::Rect2D scissor {{0, 0}, target};
+	command.setViewport(0, 1, &viewport);
+	command.setScissor(0, 1, &scissor);
+	command.draw(3, 1, 0, 0);
+	command.endRendering();
+}
+
+void PresentFilter::Release(vk::Device device) {
+	device.destroyPipeline(m_pipeline, nullptr);
+	device.destroyPipelineLayout(m_layout, nullptr);
+	device.destroyDescriptorSetLayout(m_descriptors, nullptr);
+	device.destroySampler(m_sampler, nullptr);
+	m_pipeline    = nullptr;
+	m_layout      = nullptr;
+	m_descriptors = nullptr;
+	m_sampler     = nullptr;
+	m_format      = vk::Format::eUndefined;
 }
 
 void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer) {
@@ -885,7 +1163,27 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	const auto final_layout =
 	    m_bridge ? vk::ImageLayout::eGeneral : vk::ImageLayout::ePresentSrcKHR;
 	const bool draw_attachment = draw_overlay || draw_system_overlay;
-	if (interpolated) {
+	// KYTY_PRESENT_BOX_DOWNSCALE: shrinking by less than 2x draws with PresentFilter instead of
+	// the blit (windowInternal.h).
+	const vk::Extent2D source_extent =
+	    source != nullptr ? vk::Extent2D {source->image.extent.width, source->image.extent.height}
+	                      : vk::Extent2D {};
+	const bool filtered = !interpolated && source != nullptr && PresentBoxDownscaleEnabled() &&
+	                      PresentNeedsFilter(source_extent, m_extent);
+	if (filtered) {
+		if (source->view == nullptr) {
+			vk::ImageViewCreateInfo view {};
+			view.image            = source->image.image;
+			view.viewType         = vk::ImageViewType::e2D;
+			view.format           = source->image.format;
+			view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			RequireVulkanSuccess(
+			    m_window.graphic_ctx.device.createImageView(&view, nullptr, &source->view),
+			    "create presentation source view");
+		}
+		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
+		                vk::AccessFlagBits2::eShaderRead);
+	} else if (interpolated) {
 		interpolated->Transit(vk::ImageLayout::eTransferSrcOptimal,
 		                      vk::AccessFlagBits2::eTransferRead, {}, vk_command);
 	} else if (source != nullptr) {
@@ -898,10 +1196,12 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	}
 
 	vk::ImageMemoryBarrier to_transfer {};
-	to_transfer.sType                           = vk::StructureType::eImageMemoryBarrier;
-	to_transfer.dstAccessMask                   = vk::AccessFlagBits::eTransferWrite;
-	to_transfer.oldLayout                       = vk::ImageLayout::eUndefined;
-	to_transfer.newLayout                       = vk::ImageLayout::eTransferDstOptimal;
+	to_transfer.sType = vk::StructureType::eImageMemoryBarrier;
+	to_transfer.dstAccessMask =
+	    filtered ? vk::AccessFlagBits::eColorAttachmentWrite : vk::AccessFlagBits::eTransferWrite;
+	to_transfer.oldLayout = vk::ImageLayout::eUndefined;
+	to_transfer.newLayout =
+	    filtered ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eTransferDstOptimal;
 	to_transfer.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_transfer.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_transfer.image                           = m_images[m_image_index];
@@ -911,12 +1211,16 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_transfer.subresourceRange.baseArrayLayer = 0;
 	to_transfer.subresourceRange.layerCount     = 1;
 	// Match the acquire wait stage so the layout transition cannot precede acquisition.
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
-	                           nullptr, 0, nullptr, 1, &to_transfer);
+	const auto write_stage = filtered ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+	                                  : vk::PipelineStageFlagBits::eTransfer;
+	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, write_stage,
+	                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &to_transfer);
 
-	if (source != nullptr || interpolated) {
-		const auto&   image = interpolated ? interpolated->backing : source->image;
+	if (filtered) {
+		m_filter.Record(m_window.graphic_ctx.device, vk_command, source->view, 0, source_extent,
+		                m_image_views[m_image_index], m_format, m_extent);
+	} else if (source != nullptr || interpolated) {
+		const auto& image = interpolated ? interpolated->backing : source->image;
 		vk::ImageBlit region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 		region.srcSubresource.mipLevel       = 0;
@@ -943,13 +1247,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 
 	vk::ImageMemoryBarrier to_present {};
 	to_present.sType               = vk::StructureType::eImageMemoryBarrier;
-	to_present.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	to_present.srcAccessMask =
+	    filtered ? vk::AccessFlagBits::eColorAttachmentWrite : vk::AccessFlagBits::eTransferWrite;
 	to_present.dstAccessMask       = draw_attachment ? vk::AccessFlagBits::eColorAttachmentRead |
 	                                                       vk::AccessFlagBits::eColorAttachmentWrite
 	                                                 : vk::AccessFlagBits::eMemoryRead;
-	to_present.oldLayout           = vk::ImageLayout::eTransferDstOptimal;
-	to_present.newLayout =
-	    draw_attachment ? vk::ImageLayout::eColorAttachmentOptimal : final_layout;
+	to_present.oldLayout           = to_transfer.newLayout;
+	to_present.newLayout           = draw_attachment ? vk::ImageLayout::eColorAttachmentOptimal
+	                                                 : final_layout;
 	to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	to_present.image               = m_images[m_image_index];
@@ -958,7 +1263,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_present.subresourceRange.levelCount     = 1;
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	vk_command.pipelineBarrier(write_stage,
 	                           draw_attachment ? vk::PipelineStageFlagBits::eColorAttachmentOutput
 	                                           : vk::PipelineStageFlagBits::eAllCommands,
 	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
@@ -1007,7 +1312,11 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler, uint64_t producer_tick) 
 		submit.AddWait(producer.GetMasterSemaphore().Handle(), producer_tick);
 	}
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick = scheduler.Submit(submit);
+	if (m_frame_index < m_frame_ticks.size()) {
+		m_frame_ticks[m_frame_index] = tick;
+	}
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -1015,6 +1324,9 @@ Swapchain::Status Swapchain::Present() {
 		if (!m_bridge->Present(m_image_index)) return Status::Recreate;
 		m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
 		return Status::Success;
+	}
+	if (m_minimized || m_handle == nullptr) {
+		return Status::Minimized;
 	}
 	EXIT_IF(m_image_index >= m_render_complete.size());
 	const auto         ready = m_render_complete[m_image_index];
@@ -1032,6 +1344,7 @@ Swapchain::Status Swapchain::Present() {
 		const auto        queue = graphics.present_queue ? graphics.present_queue : graphics.queue;
 		Common::LockGuard lock(queue != graphics.queue ? graphics.present_queue_mutex
 		                                               : graphics.queue_mutex);
+		if (queue == graphics.queue) graphics.submission_queue.DrainReadyForPresentLocked();
 		result = queue.presentKHR(&present);
 	}
 	switch (result) {
@@ -1048,6 +1361,10 @@ Swapchain::Status Swapchain::Present() {
 		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
+	if (m_suboptimal) {
+		m_suboptimal = false;
+		return Status::Recreate;
+	}
 	return Status::Success;
 }
 
@@ -1357,6 +1674,7 @@ void Presenter::Impl::Present(bool new_frame) {
 	if (swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
+	if (swapchain.IsMinimized()) return;
 	const bool external_frame = fg && fg->External() && fg->Enabled() && generate_frame;
 	if (external_frame && fg->BeginFrame()) {
 		Image*         output                = nullptr;
@@ -1370,7 +1688,7 @@ void Presenter::Impl::Present(bool new_frame) {
 			output = fg->Interpolate(present_scheduler, *interpolation_command, *frame.fg_inputs,
 			                         frame.image, swapchain.Extent());
 		}
-		const auto acquired = output ? swapchain.AcquireNextImage() : Swapchain::Status::Success;
+		const auto acquired = output ? swapchain.AcquireNextImage(present_scheduler) : Swapchain::Status::Success;
 		{
 			Common::LockGuard render_lock(renderer.GetMutex());
 			uint64_t          producer_tick = 0;
@@ -1426,9 +1744,13 @@ void Presenter::Impl::PresentLayers(bool new_frame, bool generate_frame, uint64_
 		// Sleep before recording/locking; producers can keep submitting guest work.
 		bool fg_tag_failed =
 		    fg && !fg->External() && fg->Enabled() && generate_frame && !fg->BeginFrame();
-		auto status = swapchain.AcquireNextImage();
+		auto status = swapchain.AcquireNextImage(present_scheduler);
+		if (status == Swapchain::Status::Minimized) return;
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
+			if (swapchain.IsMinimized()) {
+				return;
+			}
 			continue;
 		}
 		{
@@ -1461,11 +1783,17 @@ void Presenter::Impl::PresentLayers(bool new_frame, bool generate_frame, uint64_
 		}
 		if (fg && generate_frame) fg->PresentStart();
 		status = swapchain.Present();
+		if (status == Swapchain::Status::Minimized) {
+			return;
+		}
 		if (fg)
 			fg->PresentEnd(layers[0].frame ? layers[0].frame->fg_inputs.get() : nullptr,
 			               generate_frame);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
+			if (swapchain.IsMinimized()) {
+				return;
+			}
 			continue;
 		}
 		if (recreate_after_present) RecoverSwapchain(Swapchain::Status::Recreate);

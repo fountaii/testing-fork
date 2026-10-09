@@ -22,16 +22,34 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// Also emit CompileResult::spirv_plain for a GET_LOD_STATS-instrumented pixel shader
+	// (KYTY_LOD_STATS_PLAIN_VARIANT).
+	bool                        plain_mip_stats_variant = false;
+};
+
+// A function an S_SWAPPC_B64 call jumps to, as the dispatch's user data gives it: `address` is the
+// value of user SGPRs s[user_sgpr:user_sgpr+1]; the callee returns through s[return_sgpr:+1].
+struct CallTarget {
+	uint64_t address     = 0;
+	uint32_t user_sgpr   = 0;
+	uint32_t return_sgpr = 0;
 };
 
 struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	bool        skip_dispatch = false;
+	// Only for a program skipped because it calls through S_SWAPPC_B64 (KYTY_SRT_VARIANT_READS).
+	std::vector<CallTarget> call_targets;
 };
 
 struct CompileResult {
 	std::vector<uint32_t>  spirv;
+	// The same program without GET_LOD_STATS feedback (Spirv::EmitProgram mip_stats_records=false):
+	// its only difference is the absent per-sample recording. Empty unless requested and the
+	// program is instrumented.
+	std::vector<uint32_t>  spirv_plain;
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;

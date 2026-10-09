@@ -1,9 +1,13 @@
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -77,6 +81,7 @@ ImageSampleLayout Layout(const IR::MemoryInfo& mem) {
 	layout.coord = cursor;
 	cursor += info.coordinate_components;
 	if (HasFlag(mem, Decoder::ImageSampleFlagLod)) layout.lod = cursor++;
+	if (HasFlag(mem, Decoder::ImageSampleFlagLodClamp)) layout.clamp = cursor++;
 	return layout;
 }
 
@@ -360,6 +365,198 @@ uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR
 	return result;
 }
 
+// IMAGE_SAMPLE*_O (RDNA2 ISA 8.2.5): one dword of six-bit signed texel offsets, x in bits 5:0,
+// y in 13:8 and z in 21:16, added to the texel coordinates of the level that is read. Vulkan
+// accepts only constant offsets on sample instructions (ConstOffset), within
+// [minTexelOffset, maxTexelOffset]; every implementation supports -8..7. Other offsets move the
+// normalized coordinate by offset / level size instead (ApplyDynamicSampleOffset).
+struct SampleOffset {
+	uint32_t const_offset = 0;     // ConstOffset operand id; 0 when there is none
+	uint32_t packed       = 0;     // the packed offsets when they need ApplyDynamicSampleOffset
+	bool     dynamic      = false;
+};
+
+int32_t SignExtend6(uint32_t value) {
+	return static_cast<int32_t>((value & 0x3fu) ^ 0x20u) - 0x20;
+}
+
+// The condition masking every use of an image result: each use is a component extract whose
+// every use is SelectU32(condition, component, old), i.e. the destination write under EXEC.
+// Lanes where it is false discard the result, so an operand written under the same condition
+// (Select(condition, value, old)) may be read as `value`.
+std::optional<IR::Value> ResultExecGuard(const IR::Inst& inst) {
+	std::optional<IR::Value> guard;
+	if (!inst.HasUses()) {
+		return std::nullopt;
+	}
+	for (const auto& use: inst.Uses()) {
+		const auto* extract = use.user;
+		if (extract == nullptr || extract->GetOpcode() != IR::ValueOpcode::CompositeExtractU32x4 ||
+		    !extract->HasUses()) {
+			return std::nullopt;
+		}
+		for (const auto& extract_use: extract->Uses()) {
+			const auto* select = extract_use.user;
+			if (select == nullptr || select->GetOpcode() != IR::ValueOpcode::SelectU32 ||
+			    extract_use.operand != 1u) {
+				return std::nullopt;
+			}
+			const auto condition = select->Arg(0).Resolve();
+			if (guard.has_value() && !(*guard == condition)) {
+				return std::nullopt;
+			}
+			guard = condition;
+		}
+	}
+	return guard;
+}
+
+SampleOffset SampleOffsetFor(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                             const IR::Inst& address, const ImageSampleLayout& layout,
+                             ImageDimension dimension, bool cube) {
+	SampleOffset result;
+	if (!GetCodegenOptions().sample_offsets || layout.offset == NoImageComponent ||
+	    mem.image_address_components <= layout.offset) {
+		return result;
+	}
+	if (cube) {
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			std::fputs("Warning: IMAGE_SAMPLE*_O offsets on a cube map are ignored.\n", stderr);
+		}
+		return result;
+	}
+	auto&      state      = ctx.state;
+	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
+	const auto packed_index =
+	    Decoder::ImageAddressComponentLayout(mem.image_sample_flags, layout.offset).bit_offset / 32u;
+	auto value =
+	    packed_index < address.NumArgs() ? address.Arg(packed_index).Resolve() : IR::Value(0u);
+	// Offsets are literals in guest code; under a non-uniform EXEC the register holds
+	// Select(exec, literal, old), which the lanes that keep the result see as the literal.
+	if (!value.IsImmediate()) {
+		if (const auto guard = ResultExecGuard(inst); guard.has_value()) {
+			while (!value.IsImmediate()) {
+				const auto* select = value.TryInstruction();
+				if (select == nullptr || select->GetOpcode() != IR::ValueOpcode::SelectU32 ||
+				    !(select->Arg(0).Resolve() == *guard)) {
+					break;
+				}
+				value = select->Arg(1).Resolve();
+			}
+		}
+	}
+	if (value.IsImmediate() &&
+	    (value.GetType() == IR::Type::U32 || value.GetType() == IR::Type::F32)) {
+		const auto bits = value.GetType() == IR::Type::U32 ? value.U32()
+		                                                   : std::bit_cast<uint32_t>(value.F32Value());
+		int32_t offsets[3] = {};
+		bool    in_range   = true;
+		bool    any        = false;
+		for (uint32_t index = 0; index < components; index++) {
+			offsets[index] = SignExtend6(bits >> (index * 8u));
+			in_range       = in_range && offsets[index] >= -8 && offsets[index] <= 7;
+			any            = any || offsets[index] != 0;
+		}
+		if (!any) {
+			return result;
+		}
+		if (in_range) {
+			uint32_t ids[3] = {};
+			for (uint32_t index = 0; index < components; index++) {
+				ids[index] = ConstantI32(state, offsets[index]);
+			}
+			if (components == 1u) {
+				result.const_offset = ids[0];
+			} else if (components == 2u) {
+				result.const_offset = state.builder.Constant(
+				    spv::OpConstantComposite, TypeI32Vector(state, 2), ids[0], ids[1]);
+			} else {
+				result.const_offset = state.builder.Constant(
+				    spv::OpConstantComposite, TypeI32Vector(state, 3), ids[0], ids[1], ids[2]);
+			}
+			return result;
+		}
+	}
+	result.dynamic = true;
+	result.packed  = AddressU32(ctx, mem, address, layout.offset);
+	return result;
+}
+
+// Moves `coord` by the packed texel offsets divided by the size of the level `level_f32`
+// (relative to the view's base, clamped to the view's levels). Exact for single-level reads up
+// to float rounding; with linear mip filtering the coarser level moves by half the offset.
+uint32_t ApplyDynamicSampleOffset(EmitterState& state, uint32_t resource, uint32_t coord,
+                                  ImageDimension dimension, uint32_t packed, uint32_t level_f32) {
+	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+	if (!warned.test_and_set(std::memory_order_relaxed)) {
+		std::fputs("Warning: IMAGE_SAMPLE*_O offsets that are not constant or lie outside -8..7 "
+		           "move the coordinate by offset / level size.\n",
+		           stderr);
+	}
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto& info       = ImageDimensionInfoFor(dimension);
+	const auto  components = info.spatial_components;
+	const auto  image      = LoadImageDescriptor(state, resource);
+	const auto  levels     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQueryLevels, TypeU32(state), levels, image);
+	const auto floored = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
+	                          GLSLstd450FMax, level_f32, ConstantF32Value(state, 0.0f));
+	const auto level_float = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), level_float, GlslStd450(state),
+	                          GLSLstd450Floor, floored);
+	const auto level_u32 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), level_u32, level_float);
+	const auto last  = Binary(state, spv::OpISub, TypeU32(state), levels, ConstantU32(state, 1));
+	const auto level = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), level, GlslStd450(state),
+	                          GLSLstd450UMin, level_u32, last);
+	const auto size = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, dimension), size,
+	                          image, level);
+	const auto packed_i32 = Unary(state, spv::OpBitcast, TypeI32(state), packed);
+	uint32_t   moved[4]   = {};
+	for (uint32_t index = 0; index < info.coordinate_components; index++) {
+		auto component = coord;
+		if (info.coordinate_components > 1u) {
+			component = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), component, coord,
+			                          index);
+		}
+		if (index < components) {
+			const auto offset = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), offset, packed_i32,
+			                          ConstantU32(state, index * 8u), ConstantU32(state, 6));
+			const auto offset_f32 = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertSToF, TypeF32(state), offset_f32, offset);
+			auto extent = size;
+			if (info.coordinate_components > 1u) {
+				extent = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size,
+				                          index);
+			}
+			const auto extent_f32 = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), extent_f32, extent);
+			component = Binary(state, spv::OpFAdd, TypeF32(state), component,
+			                   Binary(state, spv::OpFDiv, TypeF32(state), offset_f32, extent_f32));
+		}
+		moved[index] = component;
+	}
+	if (info.coordinate_components == 1u) {
+		return moved[0];
+	}
+	const auto result = state.builder.AllocateId();
+	if (info.coordinate_components == 2u) {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), result,
+		                          moved[0], moved[1]);
+	} else {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), result,
+		                          moved[0], moved[1], moved[2]);
+	}
+	return result;
+}
+
 uint32_t HorizontalOffsets(EmitterState& state, ImageDimension dimension) {
 	const auto components   = ImageDimensionInfoFor(dimension).spatial_components;
 	const auto count        = ConstantU32(state, 4);
@@ -615,7 +812,192 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return PackImageTexel(ctx, mem, texel);
 }
 
+spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
+	switch (opcode) {
+		case IR::ValueOpcode::ImageAtomicSwap32:
+		case IR::ValueOpcode::ImageAtomicSwap64: return spv::OpAtomicExchange;
+		case IR::ValueOpcode::ImageAtomicIAdd32:
+		case IR::ValueOpcode::ImageAtomicIAdd64: return spv::OpAtomicIAdd;
+		case IR::ValueOpcode::ImageAtomicSMin32: return spv::OpAtomicSMin;
+		case IR::ValueOpcode::ImageAtomicUMin32:
+		case IR::ValueOpcode::ImageAtomicUMin64: return spv::OpAtomicUMin;
+		case IR::ValueOpcode::ImageAtomicSMax32: return spv::OpAtomicSMax;
+		case IR::ValueOpcode::ImageAtomicUMax32:
+		case IR::ValueOpcode::ImageAtomicUMax64: return spv::OpAtomicUMax;
+		case IR::ValueOpcode::ImageAtomicAnd32:
+		case IR::ValueOpcode::ImageAtomicAnd64: return spv::OpAtomicAnd;
+		case IR::ValueOpcode::ImageAtomicOr32:
+		case IR::ValueOpcode::ImageAtomicOr64: return spv::OpAtomicOr;
+		case IR::ValueOpcode::ImageAtomicXor32:
+		case IR::ValueOpcode::ImageAtomicXor64: return spv::OpAtomicXor;
+		case IR::ValueOpcode::ImageAtomicISub32: return spv::OpAtomicISub;
+		// R32ui texel pointers: SMin/SMax interpret the unsigned bits as signed.
+		// Compare-exchange and wrapping inc/dec are expanded by EmitImage.
+		case IR::ValueOpcode::ImageAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
+		case IR::ValueOpcode::ImageAtomicInc32:
+		case IR::ValueOpcode::ImageAtomicDec32: return spv::OpAtomicCompareExchangeWeak;
+		default: return spv::OpNop;
+	}
+}
+
 } // namespace
+
+// GET_LOD_STATS feedback. The per-draw shader data holds one field per image
+// (LodStatsReport::ImageField). The mip_stats buffer holds 257 finest-mip words followed by 257
+// counts; entry 256 absorbs images without a counter. The field is uniform per draw, so one lane
+// per subgroup records the subgroup's finest level and whether any lane counts.
+constexpr uint32_t MipStatsEntries = 257;
+
+// 32-bit field: counter id in bits 0..7, T# BASE_LEVEL in bits 8..11, bit 15 = no counter, U4.8
+// count threshold in bits 16..27.
+uint32_t LoadMipStatsId(EmitterState& state, uint32_t resource) {
+	return EmitShaderDataDwordLoad(state, state.program.bindings.MipStatsOffsetDword() + resource);
+}
+
+struct MipStatsSample {
+	uint32_t finest  = 0; // subgroup minimum of the absolute mip level
+	uint32_t counted = 0; // 1 when a lane's level is below the field's threshold
+};
+
+// The finest mip a sample wanted, as an absolute level: floor of the unclamped LOD plus the view's
+// BASE_LEVEL, limited to 0..14, reduced to the subgroup minimum. A lane counts when that LOD is
+// below the field's threshold: the T# MIN_LOD, i.e. the resident-level clamp raised the sample
+// (reported in bits 0..23, "MipClamp" in Astro Bot's streamer), or every sample with
+// KYTY_LOD_STATS_COUNT=samples (threshold beyond level 14).
+MipStatsSample EmitMipStatsSample(EmitterState& state, uint32_t id, uint32_t lod) {
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	const auto base_level = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 8)),
+	    ConstantU32(state, 0xfu));
+	const auto base_f32 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), base_f32, base_level);
+	// The query LOD is relative to the view's base level (T# BASE_LEVEL); report absolute mips.
+	const auto absolute = Binary(state, spv::OpFAdd, TypeF32(state), lod, base_f32);
+	const auto clamped  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+	                          GLSLstd450FClamp, absolute, ConstantF32Value(state, 0.0f),
+	                          ConstantF32Value(state, 14.0f));
+	const auto floored = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored, GlslStd450(state),
+	                          GLSLstd450Floor, clamped);
+	const auto level = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), level, floored);
+	MipStatsSample sample;
+	sample.finest = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), sample.finest,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
+	                          level);
+	// Threshold in U4.8. Compared with the level clamped to 0..14, so that magnification (a LOD
+	// below 0) is not a MIN_LOD clamp of a texture whose MIN_LOD is 0.
+	const auto threshold_fixed = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), id, ConstantU32(state, 16)),
+	    ConstantU32(state, 0xfffu));
+	const auto threshold_f32 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), threshold_f32, threshold_fixed);
+	const auto threshold = Binary(state, spv::OpFMul, TypeF32(state), threshold_f32,
+	                              ConstantF32Value(state, 1.0f / 256.0f));
+	const auto below = Binary(state, spv::OpFOrdLessThan, TypeBool(state), clamped, threshold);
+	const auto below_u32 = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), below_u32, below,
+	                          ConstantU32(state, 1), ConstantU32(state, 0));
+	sample.counted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformUMax, TypeU32(state), sample.counted,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
+	                          below_u32);
+	return sample;
+}
+
+uint32_t MipStatsElement(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.mip_stats_variable, ConstantU32(state, 0), index);
+	return pointer;
+}
+
+// Adds 1 to entry `index`'s count when a lane of the subgroup counted (one per subgroup and
+// sample instruction; the guest only tests the count for zero).
+void EmitMipStatsCount(EmitterState& state, uint32_t index, uint32_t counted) {
+	const auto any =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), counted, ConstantU32(state, 0));
+	EmitIfCondition(state, any, [&]() {
+		const auto count_index =
+		    Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, MipStatsEntries));
+		const auto add_result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), add_result,
+		                          MipStatsElement(state, count_index),
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          ConstantU32(state, 1));
+	});
+}
+
+// KYTY_LOD_STATS_GATE (default): recording for an image whose T# has a counter (checked by the
+// caller, uniformly per draw). Per subgroup, one lane
+//  - issues the finest-level AtomicUMin only when a relaxed atomic load shows a larger value.
+//    The finest words only ever decrease between resets (UMin is the only writer; the resets
+//    are transfer fills ordered before and after every draw by pipeline barriers), so a value
+//    at or below `finest` stays at or below it and the skipped UMin would not change the word.
+//    A stale larger value just issues the UMin as before.
+//  - adds 1 to the count when a lane counted (EmitMipStatsCount).
+// Images without a counter recorded into entry 256, which the host never reads; they now record
+// nothing.
+void EmitGatedMipStatsRecord(EmitterState& state, uint32_t id, uint32_t lod) {
+	const auto counter =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0xffu));
+	const auto sample  = EmitMipStatsSample(state, id, lod);
+	const auto elected = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected,
+	                          ConstantU32(state, spv::ScopeSubgroup));
+	EmitIfCondition(state, elected, [&]() {
+		const auto finest_pointer = MipStatsElement(state, counter);
+		const auto current        = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, finest_pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+		const auto lower =
+		    Binary(state, spv::OpULessThan, TypeBool(state), sample.finest, current);
+		EmitIfCondition(state, lower, [&]() {
+			const auto min_result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), min_result, finest_pointer,
+			                          ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+			                          sample.finest);
+		});
+		EmitMipStatsCount(state, counter, sample.counted);
+	});
+}
+
+void EmitMipStatsRecord(EmitterState& state, uint32_t resource, uint32_t lod) {
+	if (state.mip_stats_variable == 0 || !state.mip_stats_records ||
+	    resource >= state.program.bindings.mip_stats_count) {
+		return;
+	}
+	constexpr uint32_t Entries = MipStatsEntries;
+	const auto id = LoadMipStatsId(state, resource);
+	const auto disabled = Binary(state, spv::OpBitwiseAnd, TypeU32(state), id,
+	                             ConstantU32(state, 0x8000u));
+	const auto has_counter =
+	    Binary(state, spv::OpIEqual, TypeBool(state), disabled, ConstantU32(state, 0));
+	const auto counter =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0xffu));
+	const auto slot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, has_counter, counter,
+	                          ConstantU32(state, Entries - 1u));
+	const auto sample  = EmitMipStatsSample(state, id, lod);
+	const auto elected = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected,
+	                          ConstantU32(state, spv::ScopeSubgroup));
+	EmitIfCondition(state, elected, [&]() {
+		const auto min_result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicUMin, TypeU32(state), min_result,
+		                          MipStatsElement(state, slot), ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), sample.finest);
+		EmitMipStatsCount(state, slot, sample.counted);
+	});
+}
 
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto op         = inst.GetOpcode();
@@ -763,7 +1145,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				return sample;
 			};
 			const auto sample = image.mip_mode == IR::ImageMipMode::Dynamic && image.mip_count > 1u
-			                        ? EmitIndexSwitch(
+			                        ? EmitImageMipSwitch(
 			                              state, GatherMip(ctx, inst, mem, *address, layout,
 			                                               image.mip_count),
 			                              image.mip_count, result_type, EmitGather)
@@ -791,9 +1173,21 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
+		// IMAGE_SAMPLE*_CL: the last address component is a minimum LOD (D3D's Sample clamp).
+		// Implicit and gradient samples take it as the MinLod operand; explicit-LOD forms (every
+		// sample outside pixel shaders) raise their LOD to it.
+		uint32_t lod_clamp = 0;
+		if (layout.clamp != NoImageComponent && mem.image_address_components > layout.clamp &&
+		    GetCodegenOptions().sample_lod_clamp) {
+			lod_clamp = AddressF32(ctx, mem, *address, layout.clamp);
+		}
+		const bool gradient    = HasFlag(mem, Decoder::ImageSampleFlagDerivative);
+		const bool min_lod_op  = lod_clamp != 0u && (gradient || !explicit_lod) &&
+		                        GetHostImageFeatures().min_lod;
+		uint32_t   explicit_lod_value = 0;
 		uint32_t              operand_mask = 0;
 		std::vector<uint32_t> operands;
-		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
+		if (gradient) {
 			operand_mask |= spv::ImageOperandsGradMask;
 			operands.push_back(
 			    CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components));
@@ -805,19 +1199,66 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
 				lod = AddressF32(ctx, mem, *address, layout.lod);
 			}
+			if (lod_clamp != 0u) {
+				const auto clamped = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+				                          GLSLstd450FMax, lod, lod_clamp);
+				lod = clamped;
+			}
+			explicit_lod_value = lod;
 			operands.push_back(lod);
 		} else if (layout.bias != NoImageComponent) {
 			operand_mask |= spv::ImageOperandsBiasMask;
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
+		const auto sample_offset =
+		    SampleOffsetFor(ctx, inst, mem, *address, layout, dimension, image.cube);
+		if (sample_offset.const_offset != 0u) {
+			operand_mask |= spv::ImageOperandsConstOffsetMask;
+			operands.push_back(sample_offset.const_offset);
+		}
+		if (min_lod_op) {
+			state.builder.RequireCapability(spv::CapabilityMinLod);
+			operand_mask |= spv::ImageOperandsMinLodMask;
+			operands.push_back(lod_clamp);
+		} else if (lod_clamp != 0u && !explicit_lod) {
+			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+			if (!warned.test_and_set(std::memory_order_relaxed)) {
+				std::fputs("Warning: IMAGE_SAMPLE*_CL clamp ignored: the device lacks "
+				           "shaderResourceMinLod.\n",
+				           stderr);
+			}
+		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
-		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
+		const auto EmitSample = [&](uint32_t resource) {
 			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
+			auto        coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
-			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index);
+			if (sample_offset.dynamic) {
+				uint32_t level = ZeroF32(state);
+				if (explicit_lod_value != 0u) {
+					level = explicit_lod_value;
+				} else if (!HasFlag(mem, Decoder::ImageSampleFlagLevelZero) &&
+				           state.program.stage == ShaderType::Pixel) {
+					// The level an implicit or gradient sample reads, relative to the view base.
+					state.builder.RequireCapability(spv::CapabilityImageQuery);
+					const auto query = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    spv::OpImageQueryLod, TypeF32Vector(state, 2), query,
+					    MakeSampledImage(state, resource, sampler_id),
+					    CoordF32(ctx, mem, *address, layout.coord,
+					             ImageDimensionInfoFor(candidate.dimension).spatial_components,
+					             candidate.cube));
+					level = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), level, query,
+					                          0u);
+				}
+				coord = ApplyDynamicSampleOffset(state, resource, coord, candidate.dimension,
+				                                 sample_offset.packed, level);
+			}
+			const auto            sampled = MakeSampledImage(state, resource, sampler_id);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
 			if (dref) {
@@ -828,6 +1269,63 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
 			}
 			state.builder.AddFunction(opcode, sample_operands);
+			if (state.mip_stats_variable != 0 && state.mip_stats_records) {
+				const auto sample_lod = [&](uint32_t sampled_image) {
+					uint32_t lod = ZeroF32(state);
+					if (HasFlag(mem, Decoder::ImageSampleFlagLevelZero)) {
+						// Level 0 explicitly.
+					} else if (HasFlag(mem, Decoder::ImageSampleFlagLod) &&
+					           layout.lod != NoImageComponent) {
+						lod = AddressF32(ctx, mem, *address, layout.lod);
+					} else {
+						// Implicit or gradient sampling: the unclamped LOD (before MIN_LOD and the
+						// resident range), which is what the streamer needs to know.
+						state.builder.RequireCapability(spv::CapabilityImageQuery);
+						const auto query = state.builder.AllocateId();
+						state.builder.AddFunction(
+						    spv::OpImageQueryLod, TypeF32Vector(state, 2), query, sampled_image,
+						    CoordF32(ctx, mem, *address, layout.coord,
+						             ImageDimensionInfoFor(candidate.dimension).spatial_components,
+						             candidate.cube));
+						lod = state.builder.AllocateId();
+						state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), lod,
+						                          query, 1u);
+						// IMAGE_SAMPLE_B*: the shader bias adds to the computed LOD.
+						if (!explicit_lod && layout.bias != NoImageComponent) {
+							lod = Binary(state, spv::OpFAdd, TypeF32(state), lod,
+							             AddressF32(ctx, mem, *address, layout.bias));
+						}
+						// IMAGE_SAMPLE*_CL: the shader's own clamp raises the LOD before the T#
+						// MIN_LOD clamp does.
+						if (min_lod_op) {
+							const auto clamped = state.builder.AllocateId();
+							state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped,
+							                          GlslStd450(state), GLSLstd450FMax, lod,
+							                          lod_clamp);
+							lod = clamped;
+						}
+					}
+					return lod;
+				};
+				if (GetCodegenOptions().lod_stats_gate &&
+				    resource < state.program.bindings.mip_stats_count) {
+					// The counter id is uniform per draw: when the T# has no counter, skip the LOD
+					// query and the atomics entirely instead of recording into the unused slot.
+					const auto id          = LoadMipStatsId(state, resource);
+					const auto has_counter = Binary(
+					    state, spv::OpIEqual, TypeBool(state),
+					    Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 0x8000u)),
+					    ConstantU32(state, 0));
+					// OpSampledImage must sit in the block of its consumer, so the query inside the
+					// branch combines the image and sampler again.
+					EmitIfCondition(state, has_counter, [&]() {
+						EmitGatedMipStatsRecord(
+						    state, id, sample_lod(MakeSampledImage(state, resource, sampler_id)));
+					});
+				} else {
+					EmitMipStatsRecord(state, resource, sample_lod(sampled));
+				}
+			}
 			return sample;
 		};
 		if (image.indirect_root != mem.resource) {
@@ -843,102 +1341,128 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto* source = image.source < state.program.descriptor_sources.size()
 		                         ? &state.program.descriptor_sources[image.source]
 		                         : nullptr;
-		if (handle == nullptr || source == nullptr || !source->indirect_descriptor.has_value() ||
+		if (handle == nullptr || source == nullptr || !source->indirect_image.has_value() ||
 		    handle->NumArgs() == 0u) {
 			ctx.Fail(inst, "has invalid indirect image key provenance");
 			return;
 		}
 		const auto key = ctx.Def(handle->Arg(0));
-		if (state.flattened_srt_variable == 0 ||
+		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
 		    image.indirect_resources.size() < 2u) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");
 			return;
 		}
-		const auto selected = EmitIndirectResourceIndex(
-		    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
-		struct SampleRun {
-			uint32_t first;
-			uint32_t count;
-			uint32_t resource;
-			uint32_t slot_bias;
+		const auto LoadMapping = [&](uint32_t index) {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+			                          index);
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+			return value;
 		};
-		std::vector<SampleRun> runs;
-		for (uint32_t ordinal = 0; ordinal < image.indirect_resources.size(); ++ordinal) {
-			const auto resource = image.indirect_resources[ordinal];
-			const auto& candidate = state.program.info.images[resource];
-			const auto kind = *IR::DescriptorBindingForImage(candidate);
-			const auto& binding = *IR::FindBinding(state.program.bindings, kind);
-			if (!runs.empty()) {
-				auto& run = runs.back();
-				const auto& first = state.program.info.images[run.resource];
-				const auto next_slot = run.slot_bias + ordinal;
-				if (candidate.dimension == first.dimension && candidate.cube == first.cube &&
-				    IR::DescriptorBindingForImage(first) == kind &&
-				    candidate.mip_count == 1u && first.mip_count == 1u &&
-				    (ordinal == 1u || (next_slot < binding.resources.size() &&
-				                      binding.resources[next_slot] == resource))) {
-					// Native roots precede appended children; only the root may have a slot gap.
-					if (ordinal == 1u)
-						run.slot_bias = ResourceForDescriptor(state, kind, resource) - ordinal;
-					++run.count;
-					continue;
-				}
-			}
-			runs.push_back({ordinal, 1u, resource,
-			                ResourceForDescriptor(state, kind, resource) - ordinal});
+		const auto mapping  = ConstantU32(state, image.indirect_mapping_offset);
+		auto       low      = ConstantU32(state, 0u);
+		auto       high     = LoadMapping(mapping);
+		auto       selected = ConstantU32(state, 0u);
+		for (uint32_t iteration = 0; iteration < image.indirect_search_iterations;
+		     iteration++) {
+			const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
+			const auto mid    = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+			                           Binary(state, spv::OpIAdd, TypeU32(state), low, high),
+			                           ConstantU32(state, 1u));
+			const auto probe  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), probe, active, mid,
+			                          ConstantU32(state, 0u));
+			const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), mapping,
+			                          Binary(state, spv::OpIAdd, TypeU32(state),
+			                                 Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+			                                        probe, ConstantU32(state, 1u)),
+			                                 ConstantU32(state, 1u)));
+			const auto mapped_key = LoadMapping(entry);
+			const auto candidate  = LoadMapping(
+			    Binary(state, spv::OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+			const auto equal = Binary(state, spv::OpIEqual, TypeBool(state), mapped_key, key);
+			const auto match = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, equal);
+			const auto next_selected = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_selected, match,
+			                          candidate, selected);
+			selected              = next_selected;
+			const auto less = Binary(state, spv::OpULessThan, TypeBool(state), mapped_key, key);
+			const auto take_upper = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, less);
+			const auto take_lower = Binary(state, spv::OpLogicalAnd, TypeBool(state), active,
+			                               Unary(state, spv::OpLogicalNot, TypeBool(state), less));
+			const auto next_low   = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    spv::OpSelect, TypeU32(state), next_low, take_upper,
+			    Binary(state, spv::OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low);
+			low                  = next_low;
+			const auto next_high = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_high, take_lower, mid,
+			                          high);
+			high = next_high;
 		}
-		const auto EmitRun = [&](uint32_t index) {
-			const auto& run = runs[index];
-			if (run.count == 1u) return EmitSample(run.resource);
-			auto slot = Binary(state, spv::OpIAdd, TypeU32(state), selected,
-			                   ConstantU32(state, run.slot_bias));
-			if (run.first == 0u) {
-				const auto kind = *IR::DescriptorBindingForImage(image);
-				const auto root_slot = ResourceForDescriptor(state, kind, mem.resource);
-				if (root_slot != run.slot_bias) {
-					const auto is_root = Binary(state, spv::OpIEqual, TypeBool(state), selected,
-					                            ConstantU32(state, 0u));
-					const auto root_or_child = state.builder.AllocateId();
-					state.builder.AddFunction(spv::OpSelect, TypeU32(state), root_or_child,
-					                          is_root, ConstantU32(state, root_slot), slot);
-					slot = root_or_child;
-				}
-			}
-			return EmitSample(run.resource, slot);
-		};
-		auto run_index = ConstantU32(state, 0u);
-		for (uint32_t index = 1; index < runs.size(); ++index) {
-			const auto at_or_after = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
-			                               selected, ConstantU32(state, runs[index].first));
-			const auto next = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpSelect, TypeU32(state), next, at_or_after,
-			                          ConstantU32(state, index), run_index);
-			run_index = next;
+		const auto            default_label = state.builder.AllocateId();
+		const auto            merge_label   = state.builder.AllocateId();
+		std::vector<uint32_t> labels(image.indirect_resources.size() - 1u);
+		std::vector<uint32_t> switch_words {spv::OpSwitch, selected, default_label};
+		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
+			labels[candidate - 1u] = state.builder.AllocateId();
+			switch_words.push_back(candidate);
+			switch_words.push_back(labels[candidate - 1u]);
 		}
-		auto result = runs.size() == 1u
-		                  ? EmitRun(0u)
-		                  : EmitIndexSwitch(state, run_index, static_cast<uint32_t>(runs.size()),
-		                                    result_type, EmitRun);
+		state.builder.AddFunction(spv::OpSelectionMerge, merge_label,
+		                          spv::SelectionControlMaskNone);
+		state.builder.AddFunction(switch_words);
+		std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
+		// A sample can end in a block other than the one the case started in (the GET_LOD_STATS
+		// record branches), so the phi names the block that actually branches to the merge.
+		EmitLabel(state, default_label);
+		phi_words.push_back(EmitSample(image.indirect_resources[0]));
+		phi_words.push_back(state.current_label);
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
+			EmitLabel(state, labels[candidate - 1u]);
+			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
+			phi_words.push_back(state.current_label);
+			state.builder.AddFunction(spv::OpBranch, merge_label);
+		}
+		EmitLabel(state, merge_label);
+		state.builder.AddFunction(phi_words);
+		auto result = phi_words[2];
 		if (!dref) {
 			result = UnpackImageTexel(ctx, mem, result);
 		}
 		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 		return;
 	}
+	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (image_info.access == IR::ImageAccess::Atomic) {
 		const auto dimension = image.dimension;
+		const auto exec_arg    = inst.NumArgs() - 1;
 		const auto result_type = TypeId(state, inst.GetType());
-		const auto zero = image.atomic64 ? ConstantU64(state, 0) : ConstantU32(state, 0);
+		const auto zero        = image.atomic64 ? ConstantU64(state, 0) : ConstantU32(state, 0);
 		ctx.Define(inst, EmitValueOrDefaultIfCondition(
-		                     state, ctx.Arg(inst, inst.NumArgs() - 1), result_type, zero, [&]() {
+		                     state, ctx.Arg(inst, exec_arg), result_type, zero, [&]() {
 			           const auto pointer      = state.builder.AllocateId();
-			           const auto pointer_type =
-			               state.builder.Type(spv::OpTypePointer, spv::StorageClassImage,
-			                                  image.atomic64 ? TypeU64(state) : TypeU32(state));
+			           const auto pointer_type = state.builder.Type(
+			               spv::OpTypePointer, spv::StorageClassImage,
+			               image.atomic64 ? TypeScalarU64(state) : TypeU32(state));
 			           state.builder.AddFunction(spv::OpImageTexelPointer, pointer_type, pointer,
 			                                     ImageDescriptorPointer(state, mem.resource),
 			                                     CoordU32(ctx, mem, *address, dimension),
 			                                     ConstantU32(state, 0));
+			           if (op == IR::ValueOpcode::ImageAtomicInc32 ||
+			               op == IR::ValueOpcode::ImageAtomicDec32) {
+				           // AtomicUpdate ends with its own image-memory barrier.
+				           const auto limit = ctx.Arg(inst, 2);
+				           return AtomicUpdate(state, pointer, IR::ResourceKind::Image,
+				                               [&](uint32_t old) {
+					                               return op == IR::ValueOpcode::ImageAtomicInc32
+					                                          ? AtomicIncrement(state, old, limit)
+					                                          : AtomicDecrement(state, old, limit);
+				                               });
+			           }
 			           if (op == IR::ValueOpcode::ImageAtomicFMin32 ||
 			               op == IR::ValueOpcode::ImageAtomicFMax32) {
 				           return AtomicUpdate(state, pointer, IR::ResourceKind::Image,
@@ -948,8 +1472,40 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					                                   op == IR::ValueOpcode::ImageAtomicFMax32);
 				                               });
 			           }
-			           const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
-			           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
+			           const auto old = state.builder.AllocateId();
+			           if (image.atomic64) {
+				           // R64ui texel pointer (64-bit UMAX only): the IR's U64 is a uvec2.
+				           const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state),
+				                                    ctx.Arg(inst, 2));
+				           state.builder.AddFunction(atomic_opcode, TypeScalarU64(state), old, pointer,
+				                                     ConstantU32(state, spv::ScopeDevice),
+				                                     ConstantU32(state, spv::MemorySemanticsMaskNone),
+				                                     value);
+				           state.builder.AddFunction(
+				               spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+				               ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+				                                     spv::MemorySemanticsImageMemoryMask));
+				           return Unary(state, spv::OpBitcast, TypeU64(state), old);
+			           }
+			           if (op == IR::ValueOpcode::ImageAtomicCmpSwap32) {
+				           // DATA[0] is stored when the texel equals the comparator in DATA[1].
+				           state.builder.AddFunction(
+				               spv::OpAtomicCompareExchange, TypeU32(state), old, pointer,
+				               ConstantU32(state, spv::ScopeDevice),
+				               ConstantU32(state, spv::MemorySemanticsMaskNone),
+				               ConstantU32(state, spv::MemorySemanticsMaskNone), ctx.Arg(inst, 2),
+				               ctx.Arg(inst, 3));
+			           } else {
+				           state.builder.AddFunction(atomic_opcode, TypeU32(state), old, pointer,
+				                                     ConstantU32(state, spv::ScopeDevice),
+				                                     ConstantU32(state, spv::MemorySemanticsMaskNone),
+				                                     ctx.Arg(inst, 2));
+			           }
+			           // This pointer names storage-image memory, not a storage buffer.
+			           state.builder.AddFunction(
+			               spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
+			               ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+			                                     spv::MemorySemanticsImageMemoryMask));
 			           return old;
 		           }));
 		return;

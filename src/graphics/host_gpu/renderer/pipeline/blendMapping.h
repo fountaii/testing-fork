@@ -15,8 +15,6 @@ struct ColorComponentMapping;
 enum class BlendMappingSupport {
 	Direct,
 	SourceAlpha, // Requires logical alpha in the second blend source.
-	SourceAlphaOne, // Source alpha for RGB, one for alpha, with a shared destination equation.
-	SourceAlphaZero, // Source alpha for RGB, zero for alpha, with a shared destination equation.
 	Unsupported,
 };
 

@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include <algorithm>
 #include <bit>
@@ -92,18 +94,205 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 	return program.blocks[static_cast<size_t>(found - program.block_info.begin())];
 }
 
+// KYTY_LOOP_GUARD: true once the invocation has run more iterations than the budget.
+uint32_t LoopGuardExhausted(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.loop_guard_variable);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exhausted, count,
+	                          ConstantU32(state, GetCodegenOptions().loop_guard_budget));
+	return exhausted;
+}
+
+void SpendLoopGuard(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.loop_guard_variable);
+	state.builder.AddFunction(spv::OpStore, state.loop_guard_variable,
+	                          EmitAddU32(state, count, ConstantU32(state, 1)));
+}
+
+// KYTY_RT_NODE_BUDGET: the node tests one invocation may run (both halves of a two-lane invocation
+// count), or 0 without a budget.
+uint32_t BvhNodeLimit(const EmitterState& state) {
+	const uint64_t budget = GetCodegenOptions().rt_node_budget;
+	return static_cast<uint32_t>(std::min<uint64_t>(budget * state.lane_count, UINT32_MAX - 1u));
+}
+
+// True once a node test of the invocation was refused (the count passed the limit).
+uint32_t BvhNodeBudgetExhausted(EmitterState& state) {
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.bvh_node_count_variable);
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), exhausted, count,
+	                          ConstantU32(state, BvhNodeLimit(state)));
+	return exhausted;
+}
+
+bool BvhNodeBudgetActive(const EmitterState& state) {
+	return state.bvh_node_count_variable != 0 && GetCodegenOptions().rt_node_budget != 0;
+}
+
+// KYTY_LOOP_GUARD or KYTY_RT_NODE_BUDGET: whether this invocation leaves its loops.
+uint32_t GuardExhausted(EmitterState& state) {
+	uint32_t exhausted = 0;
+	if (state.loop_guard_variable != 0) {
+		exhausted = LoopGuardExhausted(state);
+	}
+	if (BvhNodeBudgetActive(state)) {
+		const auto bvh = BvhNodeBudgetExhausted(state);
+		if (exhausted == 0) {
+			exhausted = bvh;
+		} else {
+			const auto both = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), both, exhausted, bvh);
+			exhausted = both;
+		}
+	}
+	return exhausted;
+}
+
+uint32_t GdsDwordFromEnd(EmitterState& state, uint32_t from_end) {
+	const auto index =
+	    EmitBinaryU32(state, spv::OpISub, state.gds_length, ConstantU32(state, from_end));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.gds_variable, ConstantU32(state, 0), index);
+	return pointer;
+}
+
+void AddToGds(EmitterState& state, uint32_t pointer) {
+	const auto previous = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), previous, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+	                          ConstantU32(state, 1));
+}
+
+// At return: an invocation that exhausted KYTY_RT_NODE_BUDGET adds one to its GDS dword, and with
+// KYTY_RT_NODE_STATS an invocation that ran node tests adds one to its count's histogram bin.
+void EmitBvhNodeReport(EmitterState& state) {
+	if (state.bvh_node_count_variable == 0 || state.gds_variable == 0 || state.gds_length == 0) {
+		return;
+	}
+	if (BvhNodeBudgetActive(state)) {
+		const auto exhausted    = BvhNodeBudgetExhausted(state);
+		const auto report_label = state.builder.AllocateId();
+		const auto merge_label  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, exhausted, report_label, merge_label);
+		EmitLabel(state, report_label);
+		AddToGds(state, GdsDwordFromEnd(state, RtNodeBudgetGdsFromEnd));
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		EmitLabel(state, merge_label);
+	}
+	if (GetCodegenOptions().rt_node_stats) {
+		const auto count = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), count, state.bvh_node_count_variable);
+		// Per guest lane: both halves of a two-lane invocation count.
+		const auto per_lane =
+		    state.lane_count == 2
+		        ? EmitBinaryU32(state, spv::OpShiftRightLogical, count, ConstantU32(state, 1))
+		        : count;
+		const auto ran = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), ran, per_lane,
+		                          ConstantU32(state, 0));
+		const auto report_label = state.builder.AllocateId();
+		const auto merge_label  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, ran, report_label, merge_label);
+		EmitLabel(state, report_label);
+		const auto msb = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), msb, GlslStd450(state),
+		                          GLSLstd450FindUMsb, per_lane);
+		const auto last_bin = ConstantU32(state, RtNodeStatsBins - 1u);
+		const auto clamp    = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), clamp, GlslStd450(state),
+		                          GLSLstd450UMin, msb, last_bin);
+		const auto from_end =
+		    EmitBinaryU32(state, spv::OpIAdd, clamp, ConstantU32(state, RtNodeStatsGdsFromEnd));
+		const auto index   = EmitBinaryU32(state, spv::OpISub, state.gds_length, from_end);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.gds_variable, ConstantU32(state, 0), index);
+		AddToGds(state, pointer);
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		EmitLabel(state, merge_label);
+	}
+}
+
+bool IsLoopMergeBlock(const IR::Program& program, uint32_t target) {
+	return std::ranges::any_of(program.block_info, [=](const IR::BlockInfo& info) {
+		return info.terminator.loop_header && info.terminator.merge_block == target;
+	});
+}
+
+// An exhausted invocation reports once, at return, by adding one to the last GDS dword.
+void EmitLoopGuardReport(EmitterState& state) {
+	if (state.loop_guard_variable == 0 || state.gds_variable == 0 || state.gds_length == 0) {
+		return;
+	}
+	const auto exhausted    = LoopGuardExhausted(state);
+	const auto report_label = state.builder.AllocateId();
+	const auto merge_label  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, exhausted, report_label, merge_label);
+	EmitLabel(state, report_label);
+	const auto last    = EmitBinaryU32(state, spv::OpISub, state.gds_length, ConstantU32(state, 1));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.gds_variable, ConstantU32(state, 0), last);
+	const auto previous = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), previous, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+	                          ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+}
+
 void EmitReturn(ValueEmitContext& ctx) {
+	EmitLoopGuardReport(ctx.state);
+	EmitBvhNodeReport(ctx.state);
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	EmitGeometryMotion(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
+}
+
+uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
+	// Scalar-instruction conditions already test the full wave's raw register values.
+	if (ctx.other_half == nullptr ||
+	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||
+	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
+		return ctx.Def(info.condition);
+	}
+	const auto ballot = ctx.Ballot(info.condition);
+	const auto low    = ctx.state.builder.AllocateId();
+	const auto high   = ctx.state.builder.AllocateId();
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
+	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
+	const auto kind     = info.terminator.condition;
+	const bool zero     = kind == CFG::BranchCondition::ExecZero ||
+	                      kind == CFG::BranchCondition::VccZero ||
+	                      kind == CFG::BranchCondition::SccZero;
+	const auto combined =
+	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
+	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
+	                              result, combined, ConstantU32(ctx.state, zero ? ~0u : 0u));
+	return result;
 }
 
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
 	const auto& program = ctx.state.program;
 	const auto& term       = info.terminator;
+	const bool  degenerate_branch = term.kind == CFG::TerminatorKind::ConditionalBranch &&
+	                               !term.loop_header && term.true_block == term.false_block;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
+			if (ctx.state.loop_guard_variable != 0) {
+				SpendLoopGuard(ctx.state);
+			}
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
 			if (merge != nullptr && cont != nullptr) {
@@ -137,7 +326,33 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(info.condition);
+			if (degenerate_branch) {
+				// SPIRV-Cross discards all code after a selection whose branch targets equal its merge.
+				ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(true_block));
+				return;
+			}
+			auto condition = BranchCondition(ctx, info);
+			if (ctx.state.loop_guard_variable != 0 || BvhNodeBudgetActive(ctx.state)) {
+				// KYTY_LOOP_GUARD, KYTY_RT_NODE_BUDGET: an exhausted invocation takes whichever edge
+				// leaves a loop.
+				const bool true_exits  = IsLoopMergeBlock(program, term.true_block);
+				const bool false_exits = IsLoopMergeBlock(program, term.false_block);
+				if (true_exits != false_exits) {
+					const auto exhausted = GuardExhausted(ctx.state);
+					const auto forced    = ctx.state.builder.AllocateId();
+					if (true_exits) {
+						ctx.state.builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), forced,
+						                              condition, exhausted);
+					} else {
+						const auto alive = ctx.state.builder.AllocateId();
+						ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), alive,
+						                              exhausted);
+						ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), forced,
+						                              condition, alive);
+					}
+					condition = forced;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              ctx.Label(true_block), ctx.Label(false_block));
@@ -170,7 +385,7 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(
-			    spv::OpSelect, TypeU32(ctx.state), selected, ctx.Def(info.condition),
+			    spv::OpSelect, TypeU32(ctx.state), selected, BranchCondition(ctx, info),
 			    ConstantU32(ctx.state, term.true_block), ConstantU32(ctx.state, term.false_block));
 			return selected;
 		}
@@ -243,11 +458,205 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
+// KYTY_MOVREL_SWITCH (from BryanKAdams/KytyPS5 55a7540). A link select(index == constant, value,
+// rest) of an indexed select chain: a V_MOVRELS read is one chain over every register above the
+// source, on a uniform index (M0 & 0xff).
+struct IndexedSelectLink {
+	IR::Value index;
+	uint32_t  constant = 0;
+	IR::Value value;
+	IR::Value rest;
+};
+
+bool IndexedSelectLinkOf(const IR::Inst& inst, IndexedSelectLink& link) {
+	if (inst.GetOpcode() != IR::ValueOpcode::SelectU32 || inst.NumArgs() != 3) {
+		return false;
+	}
+	const auto* compare = inst.Arg(0).Resolve().TryInstruction();
+	if (compare == nullptr || compare->GetOpcode() != IR::ValueOpcode::IEqual32) {
+		return false;
+	}
+	auto index    = compare->Arg(0).Resolve();
+	auto constant = compare->Arg(1).Resolve();
+	if (index.IsImmediate()) {
+		std::swap(index, constant);
+	}
+	if (index.IsImmediate() || !constant.IsImmediate() || constant.GetType() != IR::Type::U32) {
+		return false;
+	}
+	link = {index, constant.U32(), inst.Arg(1), inst.Arg(2)};
+	return true;
+}
+
+// The link below `inst` on the same index, when only `inst` uses it and it is in the same block.
+const IR::Inst* NextIndexedSelect(const IR::Inst& inst, const IndexedSelectLink& link,
+                                  IndexedSelectLink& next) {
+	const auto* rest = link.rest.Resolve().TryInstruction();
+	if (rest == nullptr || rest->Parent() != inst.Parent() || rest->UseCount() != 1 ||
+	    !IndexedSelectLinkOf(*rest, next) || !(next.index == link.index)) {
+		return nullptr;
+	}
+	return rest;
+}
+
+// Shorter chains stay selects.
+constexpr size_t MinIndexedSelects = 16;
+
+void FindIndexedSelects(EmitterState& state) {
+	state.indexed_selects_found = true;
+	if (!GetCodegenOptions().movrel_switch) {
+		return;
+	}
+	std::unordered_set<const IR::Inst*> inner;
+	IndexedSelectLink                   link;
+	IndexedSelectLink                   next;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IndexedSelectLinkOf(inst, link)) {
+				if (const auto* rest = NextIndexedSelect(inst, link, next)) {
+					inner.insert(rest);
+				}
+			}
+		}
+	}
+	std::vector<const IR::Inst*> members;
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (inner.contains(&inst) || !IndexedSelectLinkOf(inst, link)) {
+				continue;
+			}
+			members.clear();
+			for (const auto* current = &inst;;) {
+				const auto* rest = NextIndexedSelect(*current, link, next);
+				if (rest == nullptr) {
+					break;
+				}
+				members.push_back(rest);
+				current = rest;
+				link    = next;
+			}
+			if (members.size() + 1u >= MinIndexedSelects) {
+				state.indexed_select_heads.insert(&inst);
+				state.indexed_select_members.insert(members.begin(), members.end());
+			}
+		}
+	}
+	// The compares of converted links emit nothing either, unless something else uses them.
+	const auto converted = [&](const IR::Inst* select) {
+		return state.indexed_select_heads.contains(select) ||
+		       state.indexed_select_members.contains(select);
+	};
+	for (const auto* set: {&state.indexed_select_heads, &state.indexed_select_members}) {
+		for (const auto* select: *set) {
+			const auto* compare = select->Arg(0).Resolve().TryInstruction();
+			if (compare != nullptr && compare->HasUses() &&
+			    std::ranges::all_of(compare->Uses(), [&](const IR::Use& use) {
+				    return use.operand == 0u && converted(use.user);
+			    })) {
+				state.indexed_select_compares.insert(compare);
+			}
+		}
+	}
+}
+
+// Emits a long indexed select chain at its outermost select as an OpSwitch on index / 16 into
+// short select chains: the host branches on the uniform index and runs one chain of at most 16
+// selects, while the code stays about as large as the whole chain (one case per index value
+// compiled about twice as slowly on AMD, for little more speed). Returns false for other
+// instructions; the chain's inner selects emit nothing.
+bool EmitIndexedSelect(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	if (!state.indexed_selects_found) {
+		FindIndexedSelects(state);
+	}
+	if (state.indexed_select_members.contains(&inst) ||
+	    state.indexed_select_compares.contains(&inst)) {
+		return true;
+	}
+	if (!state.indexed_select_heads.contains(&inst)) {
+		return false;
+	}
+	IndexedSelectLink link;
+	IndexedSelectLinkOf(inst, link);
+	const auto selector = ctx.Def(link.index);
+	// Outer links take precedence over inner ones with the same constant, as in the chain.
+	std::vector<std::pair<uint32_t, uint32_t>> cases; // Constant, value.
+	std::unordered_set<uint32_t>               constants;
+	for (const auto* current = &inst;;) {
+		if (constants.insert(link.constant).second) {
+			cases.emplace_back(link.constant, ctx.Def(link.value));
+		}
+		IndexedSelectLink next;
+		const auto*       rest = NextIndexedSelect(*current, link, next);
+		if (rest == nullptr) {
+			break;
+		}
+		current = rest;
+		link    = next;
+	}
+	const auto         fallback   = ctx.Def(link.rest);
+	constexpr uint32_t BucketBits = 4;
+	std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> buckets;
+	for (const auto& [constant, value]: cases) {
+		if (value != fallback) {
+			buckets[constant >> BucketBits].emplace_back(constant, value);
+		}
+	}
+	if (buckets.empty()) {
+		ctx.Define(inst, fallback);
+		return true;
+	}
+	const auto bucket_selector =
+	    EmitBinaryU32(state, spv::OpShiftRightLogical, selector, ConstantU32(state, BucketBits));
+	const auto            default_label = state.builder.AllocateId();
+	const auto            merge_label   = state.builder.AllocateId();
+	std::vector<uint32_t> labels;
+	std::vector<uint32_t> switch_words {spv::OpSwitch, bucket_selector, default_label};
+	for (const auto& [bucket, entries]: buckets) {
+		labels.push_back(state.builder.AllocateId());
+		switch_words.push_back(bucket);
+		switch_words.push_back(labels.back());
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(switch_words);
+	std::vector<uint32_t> phi_words {spv::OpPhi, TypeU32(state), state.builder.AllocateId(),
+	                                 fallback, default_label};
+	EmitLabel(state, default_label);
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	size_t label_index = 0;
+	for (const auto& [bucket, entries]: buckets) {
+		const auto label = labels[label_index++];
+		EmitLabel(state, label);
+		// The constants are distinct, so the order of the selects does not matter.
+		auto selected = fallback;
+		for (const auto& [constant, value]: entries) {
+			const auto match = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpIEqual, TypeBool(state), match, selector,
+			                          ConstantU32(state, constant));
+			const auto chosen = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), chosen, match, value, selected);
+			selected = chosen;
+		}
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		phi_words.push_back(selected);
+		phi_words.push_back(label);
+	}
+	EmitLabel(state, merge_label);
+	state.builder.AddFunction(phi_words);
+	ctx.Define(inst, phi_words[2]);
+	return true;
+}
+
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
 	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
 		// Both operations already combine both emulated halves into one whole-wave result.
 		ctx.Define(inst, ctx.other_half->Result(inst));
+		return;
+	}
+	if ((inst.GetOpcode() == IR::ValueOpcode::SelectU32 ||
+	     inst.GetOpcode() == IR::ValueOpcode::IEqual32) &&
+	    EmitIndexedSelect(ctx, inst)) {
 		return;
 	}
 	switch (inst.GetOpcode()) {
@@ -316,7 +725,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			auto& lane          = half == 0 ? ctx : *ctx.other_half;
 			ctx.state.lane_half = half;
 			if (half == 0 || (inst.GetOpcode() != IR::ValueOpcode::Barrier &&
-			                  inst.GetOpcode() != IR::ValueOpcode::StoreCompletion &&
+			                  inst.GetOpcode() != IR::ValueOpcode::SharedMemoryBarrier &&
 			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
 				emit_instruction(lane, inst);
 			}
@@ -372,9 +781,32 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
+	// KYTY_DISPATCHER_CAP (from Senaxx's wolverine branch): a guest loop whose trip count comes from
+	// bad data (memory an unemulated pass left unwritten) hung the GPU until the driver reset it.
+	// The invocation leaves the dispatcher after a bounded number of block transitions instead:
+	// its results are wrong, the device survives. 0 emits the loop without the bound.
+	const auto cap            = GetCodegenOptions().dispatcher_cap;
+	uint32_t   iteration      = 0;
+	uint32_t   next_iteration = 0;
+	if (cap != 0) {
+		iteration      = state.builder.AllocateId();
+		next_iteration = state.builder.AllocateId();
+	}
+	const auto finished = state.builder.AllocateId();
+	if (cap != 0) {
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), iteration, ConstantU32(state, 0u),
+		                          initial_parent, next_iteration, dispatcher.continue_label);
+	}
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), finished, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	auto done = finished;
+	if (cap != 0) {
+		const auto exhausted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), exhausted, iteration,
+		                          ConstantU32(state, cap));
+		done = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), done, finished, exhausted);
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -407,6 +839,10 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
 	EmitLabel(state, dispatcher.continue_label);
+	if (cap != 0) {
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_iteration, iteration,
+		                          ConstantU32(state, 1u));
+	}
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 	EmitLabel(state, dispatcher.merge_label);
 	EmitReturn(ctx);
@@ -627,12 +1063,24 @@ void EmitProgram(EmitterState& state) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
+	if (LoopGuardApplies(program.shader_hash) && !program.dispatcher_fallback) {
+		state.loop_guard_variable = state.builder.AllocateId();
+		state.builder.AddName(state.loop_guard_variable, "loop_guard");
+	}
+	if (IR::UsesBvhNodeCount(program)) {
+		state.bvh_node_count_variable = state.builder.AllocateId();
+		state.builder.AddName(state.bvh_node_count_variable, "bvh_node_count");
+	}
 	for (const auto* block: program.blocks) {
 		const auto label = state.builder.AllocateId();
 		state.labels.emplace(block, label);
 	}
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
+		// Insertion order of spills[0]. The high half's ids are allocated in this program order:
+		// iterating the pointer-keyed map made them depend on instruction addresses, so the same
+		// shader produced different SPIR-V on every run and missed the pipeline caches.
+		std::vector<const IR::Inst*> spill_order;
 		for (const auto* block: program.blocks) {
 			for (const auto& inst: *block) {
 				if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
@@ -643,6 +1091,7 @@ void EmitProgram(EmitterState& state) {
 					break;
 				}
 				dispatch.spills[0].emplace(&inst, state.builder.AllocateId());
+				spill_order.push_back(&inst);
 			}
 		}
 		const auto mark_cross_block = [&](IR::Value value, const IR::Block* consumer) {
@@ -658,6 +1107,7 @@ void EmitProgram(EmitterState& state) {
 			}
 			if (!dispatch.spills[0].contains(definition)) {
 				dispatch.spills[0].emplace(definition, state.builder.AllocateId());
+				spill_order.push_back(definition);
 			}
 		};
 		for (const auto* block: program.blocks) {
@@ -680,14 +1130,13 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		if (state.lane_count == 2) {
-			for (const auto& [inst, id]: dispatch.spills[0]) {
+			for (const auto* inst: spill_order) {
 				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
 			}
 			high.dispatcher_spills = &dispatch.spills[1];
 		}
 	}
 	DefineGetBdaPointer(state);
-	DefineBvhIntersect(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
 			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32;
@@ -722,6 +1171,16 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	if (state.loop_guard_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_guard_variable, spv::StorageClassFunction);
+	}
+	if (state.bvh_node_count_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.bvh_node_count_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -751,16 +1210,12 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
 	}
-	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
-		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
-		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
-		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
-		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
-		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
-		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
-		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
-		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
-		                                     ConstantU32(state, LdsDwordCount(state)));
+	if (state.bvh_node_count_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.bvh_node_count_variable,
+		                          ConstantU32(state, 0));
+	}
+	if (state.loop_guard_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

@@ -56,6 +56,7 @@ void DlssFgInputs::Wait(GraphicContext& graphics) {
 		                     "wait for Frame Generation inputs");
 	} else {
 		Common::LockGuard queue_lock(graphics.queue_mutex);
+		graphics.submission_queue.DrainPendingLocked();
 		Common::LockGuard present_lock(graphics.present_queue_mutex);
 		RequireVulkanSuccess(graphics.device.waitIdle(), "drain Frame Generation inputs");
 	}

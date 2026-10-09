@@ -115,6 +115,16 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	if (control == 0x141u) {
 		return EmitDppMirrorTargetLane(state, subid, true);
 	}
+	// DPP_ROW_SHARE (GFX10, 0x150-0x15F): every lane of a row reads lane `control & 15` of it.
+	if (control >= 0x150u && control <= 0x15fu) {
+		const auto row    = state.builder.AllocateId();
+		const auto target = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), row, subid,
+		                          ConstantU32(state, 0xfffffff0u));
+		state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row,
+		                          ConstantU32(state, control & 0xfu));
+		return {target, ConstantBool(state, true)};
+	}
 	if (control >= 0x160u && control <= 0x16fu) {
 		const auto target = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpBitwiseXor, TypeU32(state), target, subid,
@@ -132,6 +142,16 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
 	                          state.subgroup_local_invocation_id_variable);
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
+}
+
+uint32_t EmitIsHelperInvocation(EmitterState& state) {
+	if (state.helper_invocation_variable == 0) {
+		EXIT("HelperInvocation was not declared before SPIR-V function emission\n");
+	}
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeBool(state), value,
+	                          state.helper_invocation_variable);
+	return value;
 }
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {

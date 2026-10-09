@@ -38,6 +38,21 @@ struct ExceptionInfo {
 using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
+// Windows: additionally registers `handler` at the FRONT of the vectored exception handler list
+// for access violations only. It must return false (never terminate) for faults it does not
+// resolve: those continue to any other vectored handler and then to InstallHandler's, which
+// stays registered last. Returns false (nothing installed) on other platforms, where the
+// single signal handler already runs first.
+bool InstallFirstAccessHandler(Handler handler);
+
+// Windows: between EnterProbe and LeaveProbe the calling thread's faults skip InstallHandler's
+// handler (which ends the process for a fault it cannot resolve) and reach the thread's own
+// __try/__except. Vectored handlers run before frame-based handlers, so without this a fault in
+// a guarded diagnostic, such as a stack walk through a corrupt guest frame, ends the process.
+// Calls nest. Plain calls rather than a scope object: functions using __try cannot hold objects
+// with destructors. No-ops on other platforms.
+void EnterProbe();
+void LeaveProbe();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();

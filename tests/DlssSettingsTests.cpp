@@ -91,9 +91,9 @@ int main(int argc, char** argv) {
 	exported.dlss_frame_generation = true;
 	exported.frame_generation_frames = 1;
 	Configuration imported;
-	QString error;
-	Check(imported.SetGameSettings(QJsonObject::fromVariantMap(exported.GameSettings()), error) &&
-	          imported.GameSettings() == exported.GameSettings(),
-	      "upscaling settings do not survive game settings export/import");
-	std::puts("DLSS settings tests passed");
+	imported.CopyEmulatorSettingsFrom(exported);
+	Check(imported.dlss_mode == exported.dlss_mode &&
+	          imported.render_scale_percent == exported.render_scale_percent,
+	      "game setting copy lost upscaling values");
+	return 0;
 }

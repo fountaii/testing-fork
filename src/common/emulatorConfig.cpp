@@ -24,6 +24,9 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
+	EXIT_IF(cfg.audio_master_volume > MAX_AUDIO_VOLUME || cfg.audio_main_volume > MAX_AUDIO_VOLUME ||
+	        cfg.audio_music_volume > MAX_AUDIO_VOLUME ||
+	        cfg.audio_pad_speaker_main_volume > MAX_AUDIO_VOLUME);
 
 	*g_config = cfg;
 }
@@ -58,6 +61,22 @@ uint32_t GetControllerSpeakerVolume() {
 
 uint32_t GetControllerVibrationIntensity() {
 	return g_config->controller_vibration_intensity;
+}
+
+uint32_t GetAudioMasterVolume() {
+	return g_config->audio_master_volume;
+}
+
+uint32_t GetAudioMainVolume() {
+	return g_config->audio_main_volume;
+}
+
+uint32_t GetAudioMusicVolume() {
+	return g_config->audio_music_volume;
+}
+
+uint32_t GetAudioPadSpeakerOnMainVolume() {
+	return g_config->audio_pad_speaker_main_volume;
 }
 
 PresentMode GetPresentMode() {
@@ -184,10 +203,6 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
-bool SyncRawImageBuffersEnabled() {
-	return g_config->sync_raw_image_buffers;
-}
-
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
@@ -198,10 +213,6 @@ bool TrophyEnabled() {
 
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
-}
-
-bool SkipNoticeScreen() {
-	return g_config->skip_notice_screen;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

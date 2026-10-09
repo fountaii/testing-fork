@@ -10,10 +10,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
-// PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
-constexpr uint32_t PrivateApertureHigh = 0x70000000u;
-constexpr uint32_t SharedApertureHigh = 0x80000000u;
-
 enum class Family {
 	Unknown,
 	SOP1,
@@ -43,10 +39,12 @@ enum class Opcode {
 	S_MOV_B32,
 	S_MOV_B64,
 	S_CMOV_B64,
-	S_MOVK_I32,
-	S_ABS_I32,
+	S_CMOV_B32,
+	S_CMOVK_I32,
 	S_SEXT_I32_I8,
 	S_SEXT_I32_I16,
+	S_MOVK_I32,
+	S_ABS_I32,
 	S_ABSDIFF_I32,
 	S_BREV_B32,
 	S_BREV_B64,
@@ -68,6 +66,20 @@ enum class Opcode {
 	S_AND_SAVEEXEC_B64,
 	S_ORN2_SAVEEXEC_B64,
 	S_ANDN1_SAVEEXEC_B64,
+	S_OR_SAVEEXEC_B32,
+	S_XOR_SAVEEXEC_B32,
+	S_ANDN2_SAVEEXEC_B32,
+	S_ORN1_SAVEEXEC_B32,
+	S_NAND_SAVEEXEC_B32,
+	S_NOR_SAVEEXEC_B32,
+	S_XNOR_SAVEEXEC_B32,
+	S_OR_SAVEEXEC_B64,
+	S_XOR_SAVEEXEC_B64,
+	S_ANDN2_SAVEEXEC_B64,
+	S_ORN1_SAVEEXEC_B64,
+	S_NAND_SAVEEXEC_B64,
+	S_NOR_SAVEEXEC_B64,
+	S_XNOR_SAVEEXEC_B64,
 	S_NOT_B32,
 	S_NOT_B64,
 	S_WQM_B32,
@@ -226,9 +238,6 @@ enum class Opcode {
 	V_MAC_F32,
 	V_MADMK_F32,
 	V_MADAK_F32,
-	V_FMAC_F32,
-	V_FMAMK_F32,
-	V_FMAAK_F32,
 	V_MIN_F32,
 	V_MAX_F32,
 	V_ADD_F16,
@@ -266,11 +275,11 @@ enum class Opcode {
 	V_BFI_B32,
 	V_ALIGNBIT_B32,
 	V_ALIGNBYTE_B32,
+	V_PERM_B32,
 	V_MIN3_F32,
 	V_MIN3_I32,
 	V_MIN3_U32,
 	V_MIN3_F16,
-	V_MIN3_U16,
 	V_MAX3_F32,
 	V_MAX3_I32,
 	V_MAX3_U32,
@@ -384,7 +393,6 @@ enum class Opcode {
 	V_CMPX_LG_F32,
 	V_CMPX_GE_F32,
 	V_CMPX_O_F32,
-	V_CMPX_U_F32,
 	V_CMPX_NGE_F32,
 	V_CMPX_NLG_F32,
 	V_CMPX_NGT_F32,
@@ -401,8 +409,6 @@ enum class Opcode {
 	V_CMP_T_I32,
 	V_CMP_CLASS_F32,
 	V_CMPX_CLASS_F32,
-	V_CMP_CLASS_F16,
-	V_CMPX_CLASS_F16,
 	V_CMP_LT_I16,
 	V_CMP_EQ_I16,
 	V_CMP_LE_I16,
@@ -458,34 +464,19 @@ enum class Opcode {
 	V_CMP_NE_U32,
 	V_CMP_GE_U32,
 	V_CMP_T_U32,
-	V_CMP_F_I64,
 	V_CMP_EQ_I64,
 	V_CMP_LT_I64,
 	V_CMP_LE_I64,
 	V_CMP_NE_I64,
-	V_CMP_T_I64,
-	V_CMP_F_U64,
 	V_CMP_LT_U64,
 	V_CMP_EQ_U64,
 	V_CMP_LE_U64,
 	V_CMP_GT_U64,
 	V_CMP_NE_U64,
 	V_CMP_GE_U64,
-	V_CMP_T_U64,
-	V_CMPX_F_I64,
-	V_CMPX_LT_I64,
-	V_CMPX_EQ_I64,
-	V_CMPX_LE_I64,
 	V_CMPX_NE_I64,
-	V_CMPX_T_I64,
-	V_CMPX_F_U64,
-	V_CMPX_LT_U64,
-	V_CMPX_EQ_U64,
 	V_CMPX_LE_U64,
-	V_CMPX_GT_U64,
 	V_CMPX_NE_U64,
-	V_CMPX_GE_U64,
-	V_CMPX_T_U64,
 	V_CMPX_LT_U32,
 	V_CMPX_EQ_U32,
 	V_CMPX_LE_U32,
@@ -504,16 +495,16 @@ enum class Opcode {
 	S_BUFFER_LOAD_DWORDX8,
 	S_BUFFER_LOAD_DWORDX16,
 	S_MEMREALTIME,
+	S_DCACHE_INV,
+	S_GL1_INV,
 	BUFFER_LOAD_FORMAT_X,
 	BUFFER_LOAD_FORMAT_XY,
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
-	BUFFER_LOAD_FORMAT_D16_X,
 	BUFFER_STORE_FORMAT_X,
 	BUFFER_STORE_FORMAT_XY,
 	BUFFER_STORE_FORMAT_XYZ,
 	BUFFER_STORE_FORMAT_XYZW,
-	BUFFER_STORE_FORMAT_D16_X,
 	BUFFER_LOAD_UBYTE,
 	BUFFER_LOAD_SBYTE,
 	BUFFER_LOAD_USHORT,
@@ -550,8 +541,20 @@ enum class Opcode {
 	BUFFER_ATOMIC_OR,
 	BUFFER_ATOMIC_OR_X2,
 	BUFFER_ATOMIC_XOR,
+	BUFFER_ATOMIC_INC,
+	BUFFER_ATOMIC_DEC,
+	BUFFER_ATOMIC_CMPSWAP_X2,
+	BUFFER_ATOMIC_ADD_X2,
+	BUFFER_ATOMIC_SUB_X2,
+	BUFFER_ATOMIC_SMIN_X2,
+	BUFFER_ATOMIC_UMIN_X2,
+	BUFFER_ATOMIC_SMAX_X2,
+	BUFFER_ATOMIC_UMAX_X2,
+	BUFFER_ATOMIC_XOR_X2,
 	BUFFER_ATOMIC_FMIN,
 	BUFFER_ATOMIC_FMAX,
+	BUFFER_GL0_INV,
+	BUFFER_GL1_INV,
 	FLAT_LOAD_UBYTE,
 	FLAT_LOAD_SBYTE,
 	FLAT_LOAD_USHORT,
@@ -600,7 +603,6 @@ enum class Opcode {
 	DS_BPERMUTE_B32,
 	DS_CONSUME,
 	DS_APPEND,
-	DS_ORDERED_COUNT,
 	DS_READ_I8,
 	DS_READ_U8,
 	DS_READ_I16,
@@ -629,7 +631,6 @@ enum class Opcode {
 	DS_WRITE_B128,
 	DS_WRITE_ADDTID_B32,
 	DS_READ_ADDTID_B32,
-	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_RESINFO,
 	IMAGE_GET_LOD,
 	IMAGE_LOAD,
@@ -638,10 +639,13 @@ enum class Opcode {
 	IMAGE_STORE_MIP,
 	IMAGE_ATOMIC_SWAP,
 	IMAGE_ATOMIC_CMPSWAP,
-	IMAGE_ATOMIC_ADD,
+	IMAGE_ATOMIC_SUB,
 	IMAGE_ATOMIC_SMIN,
-	IMAGE_ATOMIC_UMIN,
 	IMAGE_ATOMIC_SMAX,
+	IMAGE_ATOMIC_INC,
+	IMAGE_ATOMIC_DEC,
+	IMAGE_ATOMIC_ADD,
+	IMAGE_ATOMIC_UMIN,
 	IMAGE_ATOMIC_UMAX,
 	IMAGE_ATOMIC_AND,
 	IMAGE_ATOMIC_OR,
@@ -657,13 +661,15 @@ enum class Opcode {
 	IMAGE_GATHER4_C_O,
 	IMAGE_GATHER4_C_LZ_O,
 	IMAGE_GATHER4H,
+	// MIMG 0xe6/0xe7: one ray/BVH-node test (RDNA2 ISA 8.2.10). Four result dwords, no sampler.
+	IMAGE_BVH_INTERSECT_RAY,
+	IMAGE_BVH64_INTERSECT_RAY,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
 
 	S_NOP,
 	S_WAITCNT,
-	S_WAITCNT_VSCNT,
 	S_WAITCNT_DEPCTR,
 	S_BARRIER,
 	S_BRANCH,
@@ -681,6 +687,7 @@ enum class Opcode {
 	S_TRAP,
 	S_TTRACEDATA,
 	S_INST_PREFETCH,
+	S_CLAUSE,
 	S_ENDPGM,
 	EXP,
 	COUNT
@@ -701,8 +708,6 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
-	SharedBase,
-	PrivateBase,
 	Null,
 	Vgpr,
 };
@@ -800,6 +805,10 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
+	// Texel-fail (TFE) and LOD-warning (LWE) enables. Either one makes a fetch return one
+	// status dword in the VGPR right after the data dwords.
+	bool           tfe                                          = false;
+	bool           lwe                                          = false;
 	uint32_t       branch_target                                = 0;
 	struct {
 		uint32_t target = 0;
@@ -814,6 +823,7 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
+	bool                     has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
@@ -821,7 +831,10 @@ Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void DecodeProgram(std::span<const uint32_t> code, Program& program);
+// decode_bvh=false stops at the first IMAGE_BVH*_INTERSECT_RAY, marks it unsupported and sets
+// has_bvh (the shader's dispatches are then skipped); true decodes it like any other instruction.
+void DecodeProgram(std::span<const uint32_t> code, Program& program, bool decode_bvh = false);
+[[nodiscard]] bool IsBvhIntersect(const Instruction& inst);
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 

@@ -1,11 +1,15 @@
 #include "common/threads.h"
 
 #include "common/assert.h"
+#include "common/cpuPlacement.h"
+#include "common/hangWatchdog.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
 #include <condition_variable> // IWYU pragma: keep
+#include <cstdlib>
 #include <mutex>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
@@ -22,10 +26,37 @@
 #include <string>
 #include <thread>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
+namespace Common {
+
+bool ShortSleepsBlock() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHORT_SLEEP_BLOCK");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
+} // namespace Common
+
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
-constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
+constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
+
+// Spins of a contested Common::Mutex before it blocks (KYTY_CS_SPIN_COUNT, default 4000; 0 blocks
+// at once and leaves the core to other threads). Read once, at the first mutex.
+static DWORD CsSpinCount() {
+	static const DWORD count = [] {
+		const char* value = std::getenv("KYTY_CS_SPIN_COUNT");
+		return value != nullptr && value[0] != '\0' ? static_cast<DWORD>(std::strtoul(value, nullptr, 10))
+		                                            : DWORD {4000};
+	}();
+	return count;
+}
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -34,6 +65,30 @@ constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 static void SleepHighResolution100ns(uint64_t units_100ns) {
 	if (units_100ns == 0) {
 		return;
+	}
+
+	// Keep spinning only where a kernel transition is
+	// likely to cost more than the requested delay; ordinary millisecond sleeps use the
+	// per-thread high-resolution waitable timer below (always with KYTY_SHORT_SLEEP_BLOCK=1).
+	if (units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS && !Common::ShortSleepsBlock()) {
+		LARGE_INTEGER frequency {};
+		LARGE_INTEGER start {};
+		if (QueryPerformanceFrequency(&frequency) != 0 && QueryPerformanceCounter(&start) != 0 &&
+		    frequency.QuadPart > 0) {
+			const auto wait_ticks =
+			    static_cast<LONGLONG>((static_cast<long double>(units_100ns) *
+			                           static_cast<long double>(frequency.QuadPart)) /
+			                          10000000.0L);
+			const auto    deadline = start.QuadPart + std::max<LONGLONG>(wait_ticks, 1);
+			LARGE_INTEGER now {};
+			do {
+				if (QueryPerformanceCounter(&now) == 0) {
+					break;
+				}
+				YieldProcessor();
+			} while (now.QuadPart < deadline);
+			return;
+		}
 	}
 
 	thread_local HANDLE timer = CreateWaitableTimerExW(
@@ -105,13 +160,14 @@ static SleepConditionVariableCS_func_t ResolveSleepConditionVariableCS() {
 #endif
 
 #ifdef KYTY_POSIX_HIGH_RES_SLEEP
-// An absolute deadline preserves the requested sleep across signal interruptions.
+// Spin for very short waits; use an absolute deadline for longer waits.
 static void SleepHighResolutionNanos(uint64_t nanos) {
 	if (nanos == 0) {
 		return;
 	}
 
 	constexpr uint64_t NANOS_PER_SEC = 1000000000;
+	constexpr uint64_t SPIN_LIMIT_NS = 50000; // below this a context switch dominates
 
 	timespec deadline {};
 	if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
@@ -122,6 +178,17 @@ static void SleepHighResolutionNanos(uint64_t nanos) {
 	auto target_nsec = static_cast<uint64_t>(deadline.tv_nsec) + nanos;
 	deadline.tv_sec += static_cast<time_t>(target_nsec / NANOS_PER_SEC);
 	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
+
+	if (nanos <= SPIN_LIMIT_NS && !Common::ShortSleepsBlock()) {
+		timespec now {};
+		do {
+			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+				return;
+			}
+		} while (now.tv_sec < deadline.tv_sec ||
+		         (now.tv_sec == deadline.tv_sec && now.tv_nsec < deadline.tv_nsec));
+		return;
+	}
 
 	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
 	}
@@ -134,7 +201,7 @@ using thread_id_t = std::thread::id;
 
 struct MutexPrivate {
 #ifdef KYTY_WIN_CS
-	MutexPrivate() { InitializeCriticalSectionAndSpinCount(&m_cs, KYTY_CS_SPIN_COUNT); }
+	MutexPrivate() { InitializeCriticalSectionAndSpinCount(&m_cs, CsSpinCount()); }
 	~MutexPrivate() { DeleteCriticalSection(&m_cs); }
 	KYTY_CLASS_NO_COPY(MutexPrivate);
 	CRITICAL_SECTION m_cs {};
@@ -185,6 +252,71 @@ static std::atomic<int> g_thread_counter = 0;
 void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
+	// KYTY_CPU_RESERVE: the process default CPU sets, before most threads start.
+	InitCpuPlacement();
+}
+
+#ifdef KYTY_WIN_CS
+static void RaiseCurrentThreadPriorityLevel(int level) {
+	if (level == 0) {
+		return;
+	}
+	auto* thread = GetCurrentThread();
+	(void)SetThreadPriority(thread, level == 2 ? THREAD_PRIORITY_HIGHEST
+	                                           : THREAD_PRIORITY_ABOVE_NORMAL);
+	// Keep the thread off efficiency scheduling (EcoQoS) even when the window is in the
+	// background.
+	THREAD_POWER_THROTTLING_STATE throttling {};
+	throttling.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+	throttling.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+	throttling.StateMask   = 0;
+	(void)SetThreadInformation(thread, ThreadPowerThrottling, &throttling, sizeof(throttling));
+}
+#endif
+
+static int PriorityLevelFromEnv(const char* name, int fallback) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : fallback;
+}
+
+void RaiseCurrentThreadPriority() {
+#ifdef KYTY_WIN_CS
+	static const int level = PriorityLevelFromEnv("KYTY_CP_PRIORITY", 1);
+	RaiseCurrentThreadPriorityLevel(level);
+#endif
+}
+
+int ServiceThreadPriorityLevel() {
+	static const int level = PriorityLevelFromEnv("KYTY_SERVICE_PRIORITY", 2);
+	return level;
+}
+
+void RaiseServiceThreadPriority() {
+#ifdef KYTY_WIN_CS
+	RaiseCurrentThreadPriorityLevel(ServiceThreadPriorityLevel());
+#endif
+}
+
+bool YieldToReadyThread() {
+#ifdef KYTY_WIN_CS
+	return SwitchToThread() != 0;
+#else
+	std::this_thread::yield();
+	return true;
+#endif
+}
+
+void YieldAndPauseMicro(uint32_t micros) {
+	const auto start = std::chrono::steady_clock::now();
+	const auto end   = start + std::chrono::microseconds(micros);
+	(void)YieldToReadyThread();
+	while (std::chrono::steady_clock::now() < end) {
+#if defined(_M_X64) || defined(__x86_64__)
+		_mm_pause();
+#else
+		std::this_thread::yield();
+#endif
+	}
 }
 
 Thread::Thread(thread_func_t func, void* arg)
@@ -262,9 +394,23 @@ Mutex::~Mutex() {
 }
 
 void Mutex::Lock() {
+	// The uncontended path publishes no wait record. The slow path retains the resource even
+	// when EnterCriticalSection/the standard mutex never returns.
 #ifdef KYTY_WIN_CS
+	if (!HangWatchdog::Enabled()) {
+		EnterCriticalSection(&m_mutex->m_cs);
+		return;
+	}
+	if (TryEnterCriticalSection(&m_mutex->m_cs)) return;
+	HangWatchdog::Scope wait("host-mutex", reinterpret_cast<uint64_t>(this));
 	EnterCriticalSection(&m_mutex->m_cs);
 #else
+	if (!HangWatchdog::Enabled()) {
+		m_mutex->m_mutex.lock();
+		return;
+	}
+	if (m_mutex->m_mutex.try_lock()) return;
+	HangWatchdog::Scope wait("host-mutex", reinterpret_cast<uint64_t>(this));
 	m_mutex->m_mutex.lock();
 #endif
 }
@@ -292,6 +438,8 @@ CondVar::~CondVar() {
 }
 
 void CondVar::Wait(Mutex* mutex) {
+	HangWatchdog::Scope wait("host-condvar", reinterpret_cast<uint64_t>(this),
+	                         reinterpret_cast<uint64_t>(mutex));
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
@@ -339,6 +487,8 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 }
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
+	HangWatchdog::Scope wait("host-condvar-timed", reinterpret_cast<uint64_t>(this), micros, 0, 0,
+	                         reinterpret_cast<uint64_t>(mutex));
 	bool ok = false;
 #ifndef KYTY_WIN_CS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());

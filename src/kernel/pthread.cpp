@@ -2,15 +2,21 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/condWaitUntil.h"
+#include "common/cpuPlacement.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/hangWatchdog.h"
 #include "common/hostException.h"
+#include "common/liveSwitch.h"
 #include "common/logging/log.h"
+#include "common/ramStats.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
+#include "kernel/pendingSignals.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
@@ -19,14 +25,17 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -94,6 +103,60 @@ constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
 constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
 constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
 constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+// The guest's priority classes are mapped onto host priorities. On the console the graphics command
+// processor is hardware and competes with nothing; here it is a thread, and a game may keep a dozen
+// job workers spinning on a lock-free job table, so the whole guest band sits at or below the host's
+// normal priority and the emulator's own threads stay above the game's workers. Only the values the
+// operating system accepts outside the realtime class may be used here.
+constexpr int GUEST_HOST_PRIORITY_HIGH   = 0;
+constexpr int GUEST_HOST_PRIORITY_NORMAL = -1;
+constexpr int GUEST_HOST_PRIORITY_LOW    = -2;
+
+/// Maps a guest priority (a smaller value is more important) to the host priority of its band:
+/// <= 478 is high, >= 733 is low, everything in between is normal.
+static int GuestPriorityToHost(int guest_priority) {
+	if (guest_priority <= 478) {
+		return GUEST_HOST_PRIORITY_HIGH;
+	}
+	if (guest_priority >= 733) {
+		return GUEST_HOST_PRIORITY_LOW;
+	}
+	return GUEST_HOST_PRIORITY_NORMAL;
+}
+
+/// Tells whether a guest thread with this affinity runs one host priority step below its band.
+///
+/// A guest thread pinned to a single core owns that core on the console. A game that starts one such
+/// spinning job worker per core shares all of them with the threads that produce their work, on fewer
+/// host cores and in the same priority band, and the spinners starve those threads. Decided once when
+/// the thread starts: a main thread may pin itself to one core for a while and must not drop with it.
+static bool LowerCoreBoundThread(KernelCpumask affinity) {
+	return std::has_single_bit(affinity);
+}
+
+/// Host priority a guest thread runs at: the priority of its band, or one step below it (but not
+/// below the lowest band value) when the thread is pinned to a single core.
+static int GuestThreadHostPriority(int guest_priority, bool core_bound) {
+	const int host = GuestPriorityToHost(guest_priority);
+	return core_bound ? std::max(host - 1, -2) : host;
+}
+
+/// Maps a host priority of the guest band back to one of the three classes the guest sees
+/// (256 high, 700 normal, 767 low). The kernel objects use the class to order their waiters.
+static int HostPriorityToGuest(int host_priority) {
+	if (host_priority <= GUEST_HOST_PRIORITY_LOW) {
+		return 767;
+	}
+	if (host_priority >= GUEST_HOST_PRIORITY_HIGH) {
+		return 256;
+	}
+	return 700;
+}
+
+#endif
 
 static constexpr KernelClockid KERNEL_CLOCK_REALTIME          = 0;
 static constexpr KernelClockid KERNEL_CLOCK_VIRTUAL           = 1;
@@ -396,6 +459,9 @@ struct PthreadPrivate {
 	std::atomic_bool      almost_done;
 	std::atomic_bool      free;
 	uint64_t              host_thread_id;
+	// Pinned to one core when it started; such a thread runs one host priority step lower. Written
+	// by the thread itself, read by whoever changes its priority.
+	std::atomic_bool      core_bound = false;
 	uintptr_t             guest_host_rbx;
 	uintptr_t             guest_host_rsp;
 	uintptr_t             guest_host_rbp;
@@ -502,14 +568,54 @@ void PthreadWakeForSignal(Pthread thread) {
 
 void KernelDispatchPendingSignalForCurrentThread();
 
+// KYTY_PRECISE_COND_WAITS=1 (default off; live; Senaxx d069e1e99): timed condition waits wake on
+// time. Windows times condition-variable waits in whole milliseconds on the system tick, so a ~5 ms
+// wait woke up to ~1 ms late (Senaxx: the Bink sound thread, pacing 5.33 ms grains with such waits,
+// fell to 0.93x real time and the intro videos' sound crackled). The last 2.5 ms are timed with the
+// high-resolution timer in slices of at most 0.5 ms (a wake-up in that stretch is seen within a
+// slice) and a short yield loop. Off: one condition-variable wait per poll, as before.
+static Live::Switch g_precise_cond_waits("KYTY_PRECISE_COND_WAITS", Live::ParseDefaultOff);
+
+template <class Lock, class Ready>
+static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& ready,
+                          std::chrono::steady_clock::time_point deadline) {
+	Common::CondWaitUntil(lock, cv, ready, deadline, SIGNAL_APC_POLL_MICROS,
+	                      g_precise_cond_waits.On(),
+	                      [] { KernelDispatchPendingSignalForCurrentThread(); });
+}
+
+// sched_yield (FreeBSD sched_relinquish): another thread that is ready on this CPU runs first;
+// with none, the call returns at once. SwitchToThread is exactly that. The legacy path followed an
+// empty SwitchToThread with Sleep(0), a second system call per yield. In Astro Bot's GPU-fence
+// poll (eboot 0x114b2f0: scePthreadYield + sceKernelUsleep(0) in a loop) that Sleep(0) was about
+// 15 of the thread's 48 ms/flip (DEEP-TRACE-U52 section 3.6).
 static void SchedulerBackoffOnce() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (SwitchToThread() == 0) {
-		Sleep(0);
+	if (GuestSchedLegacy()) {
+		if (SwitchToThread() == 0) {
+			Sleep(0);
+		}
+		return;
 	}
-#else
-	std::this_thread::yield();
 #endif
+	(void)Common::YieldToReadyThread();
+}
+
+// A sleep of at most 1 us. FreeBSD's nanosleep blocks for at least the requested time
+// (kern_nanosleep sleeps to an absolute deadline). A Windows wait cannot be that short, so the
+// thread yields once like a block would, then pauses until the microsecond has passed. The legacy
+// path only yielded, and could return early.
+static bool SleepMicroSchedulerBackoff(uint64_t microseconds) {
+	if (microseconds > 1) {
+		return false;
+	}
+
+	if (GuestSchedLegacy()) {
+		SchedulerBackoffOnce();
+		return true;
+	}
+	Common::YieldAndPauseMicro(static_cast<uint32_t>(microseconds));
+	return true;
 }
 
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
@@ -520,7 +626,10 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 
 	while (microseconds > 0) {
 		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		Common::Thread::SleepMicro(step);
+		// KYTY_SHORT_SLEEP_BLOCK=1 (common/threads.h): every step blocks on the host timer.
+		if (Common::ShortSleepsBlock() || !SleepMicroSchedulerBackoff(step)) {
+			Common::Thread::SleepMicro(step);
+		}
 		microseconds -= step;
 		KernelDispatchPendingSignalForCurrentThread();
 	}
@@ -714,6 +823,7 @@ static int CreateGuestStack(PthreadAttr attr) {
 	attr->stack_user     = false;
 	attr->stack_map_addr = stack_addr;
 	attr->stack_map_size = map_size;
+	Common::RamStats::Range("guest thread stack", reinterpret_cast<void*>(stack_addr), map_size);
 
 	std::memset(attr->stack_addr, 0, stack_size);
 
@@ -856,6 +966,9 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	}
 
 	// The guest ABI expects the entry argument in rdi and a 16-byte aligned stack before call.
+	// PthreadExit resumes after the asm below with RBX taken from the snapshot above, so RBX is
+	// declared clobbered: the compiler must not keep a value in it across the guest call (code
+	// layout and inlining changes, e.g. under PGO, can otherwise cache a pointer there).
 #if defined(__APPLE__)
 	// Keep inputs out of r12/r13.
 	register uintptr_t guest_rsp_reg asm("r14") = guest_rsp;
@@ -873,11 +986,14 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
 	             : [guest_rsp] "r"(guest_rsp_reg), [guest_rbp] "r"(guest_rbp_reg)
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
+	             : "cc", "memory", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
+	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
 #else
 	// PthreadExit resumes at this frame, so all four saved registers stay on the host stack.
+	// The stack input is tied to RAX (the return register): R12-R15 are overwritten before it is
+	// read, and an input register the compiler is free to pick could be one of them. The guest
+	// frame pointer equals the stack pointer here (guest_rbp == guest_rsp).
 	asm volatile("pushq %%r12\n\t"
 	             "pushq %%r13\n\t"
 	             "pushq %%r14\n\t"
@@ -892,7 +1008,7 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "movq %%rsp, %%r12\n\t"
 	             "movq %%rbp, %%r13\n\t"
 	             "movq %[guest_rsp], %%rsp\n\t"
-	             "movq %[guest_rbp], %%rbp\n\t"
+	             "movq %[guest_rsp], %%rbp\n\t"
 	             "callq *%%rsi\n\t"
 	             "movq %%r13, %%rbp\n\t"
 	             "movq %%r12, %%rsp\n\t"
@@ -905,15 +1021,15 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	             "popq %%r13\n\t"
 	             "popq %%r12\n\t"
 	             : "=a"(ret), "+D"(arg), "+S"(func)
-	             : [guest_rsp] "r"(guest_rsp), [guest_rbp] "r"(guest_rbp)
+	             : [guest_rsp] "0"(guest_rsp)
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2",
-	               "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
+	             : "cc", "memory", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "xmm0", "xmm1",
+	               "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
 	               "xmm12", "xmm13", "xmm14", "xmm15");
 #else
-	             : "cc", "memory", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13", "xmm0",
-	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
-	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+	             : "cc", "memory", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r13",
+	               "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9",
+	               "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 #endif
 #endif
 
@@ -934,6 +1050,42 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	return func(arg);
 #endif
 }
+
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+static void* KYTY_SYSV_ABI GuestStackReturnProbe(void* value) {
+	return value;
+}
+static void* KYTY_SYSV_ABI GuestStackExitProbe(void* value) {
+	// The exit restores this snapshot instead of the RBX value live at the guest call: poison it
+	// so a value the compiler kept in RBX across the call cannot survive by accident.
+	g_pthread_self->guest_host_rbx = 0x19;
+	PthreadExit(value);
+	return nullptr;
+}
+
+bool TestGuestStackExitLifecycle() {
+#if defined(__x86_64__) || defined(_M_X64)
+	std::vector<uint8_t> stack(1024 * 1024);
+	PthreadPrivate       thread {};
+	const auto           saved_self   = g_pthread_self;
+	const auto           saved_return = g_guest_entry_return_rsp;
+	g_pthread_self                    = &thread;
+	bool passed                       = true;
+	for (const auto entry: {&GuestStackReturnProbe, &GuestStackExitProbe}) {
+		auto*      value  = reinterpret_cast<void*>(uintptr_t {0x12345678});
+		const auto result = RunOnGuestStack(value, entry, stack.data() + stack.size());
+		passed &= result == value && g_pthread_self == &thread && g_guest_entry_return_rsp == 0 &&
+		          thread.guest_host_rbx == 0 && thread.guest_host_rsp == 0 &&
+		          thread.guest_host_rbp == 0;
+	}
+	g_pthread_self           = saved_self;
+	g_guest_entry_return_rsp = saved_return;
+	return passed;
+#else
+	return true;
+#endif
+}
+#endif
 
 static void UpdateCurrentThreadStackAttr(PthreadAttr* attr) {
 	if (attr == nullptr || *attr == nullptr) {
@@ -1008,6 +1160,7 @@ void PthreadInitSelfForMainThread() {
 	UpdateCurrentThreadStackAttr(&g_pthread_self->attr);
 	g_pthread_self->p               = pthread_self();
 	g_pthread_self->name            = "MainThread";
+	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(g_pthread_self), "MainThread");
 	g_pthread_self->guest.thread_id = ++g_pthread_thread_id;
 	g_pthread_self->unique_id       = Common::Thread::GetThreadIdUnique();
 	g_pthread_self->free            = false;
@@ -1267,8 +1420,13 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		return EDEADLK;
 	}
 
+	std::optional<HangWatchdog::Scope> blocked;
+	if (mutex->owner != nullptr)
+		blocked.emplace("guest-mutex", reinterpret_cast<uint64_t>(mutex),
+		                reinterpret_cast<uint64_t>(self), reinterpret_cast<uint64_t>(mutex->owner));
 	if (timeout_us == nullptr) {
 		while (mutex->owner != nullptr) {
+			if (blocked) blocked->Observed(reinterpret_cast<uint64_t>(mutex->owner));
 			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 			if (mutex->owner != nullptr) {
 				lock.unlock();
@@ -1734,6 +1892,12 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 	// PRINT_NAME();
 
+	// Placement samples of guest threads (common/cpuPlacement.h), every 64th lock.
+	static thread_local uint32_t placement_locks = 0;
+	if ((++placement_locks & 63u) == 0u) {
+		Common::SamplePlacement(Common::ThreadRole::Guest);
+	}
+
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	mutex = static_cast<PthreadMutex*>(
@@ -2137,6 +2301,8 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 	return OK;
 }
 
+/// Stores the guest priority in the attribute and, on Windows, the host priority of its band in the
+/// native attribute. Fails with EINVAL when the attribute or the parameter is invalid.
 int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedParam* param) {
 	// PRINT_NAME();
 
@@ -2147,13 +2313,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	KernelSchedParam pparam {};
-	if (param->sched_priority <= 478) {
-		pparam.sched_priority = +2;
-	} else if (param->sched_priority >= 733) {
-		pparam.sched_priority = -2;
-	} else {
-		pparam.sched_priority = 0;
-	}
+	pparam.sched_priority = GuestPriorityToHost(param->sched_priority);
 
 	if (pthread_attr_setschedparam(&attr_value->p, &pparam) != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -2383,6 +2543,10 @@ static int RwlockLockCooperative(PthreadRwlock rwlock, bool write, KernelUsecond
 				}
 			}
 
+			HangWatchdog::Scope wait(write ? "guest-rwlock-write" : "guest-rwlock-read",
+			                         reinterpret_cast<uint64_t>(rwlock), write,
+			                         reinterpret_cast<uint64_t>(rwlock->writer), 0,
+			                         rwlock->reader_count);
 			if (has_timeout) {
 				const auto now = std::chrono::steady_clock::now();
 				if (*timeout_us == 0 || now >= deadline) {
@@ -2857,6 +3021,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 		return KERNEL_ERROR_EPERM;
 	}
 
+	HangWatchdog::Scope wait("guest-condition", reinterpret_cast<uint64_t>(cond_value),
+	                         reinterpret_cast<uint64_t>(mutex_value));
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -2875,26 +3041,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	if (usec == 0) {
 		result = ETIMEDOUT;
 	} else {
-		while (!ready()) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				break;
-			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			thread->cond_cv.wait_for(cond_lock, poll);
-
-			if (!ready()) {
-				cond_lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				cond_lock.lock();
-			}
-		}
-
+		CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 		result = (ready() ? OK : ETIMEDOUT);
 	}
 	CondRemoveWaiter(cond_value, thread);
@@ -2946,6 +3093,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 		return KERNEL_ERROR_EPERM;
 	}
 
+	HangWatchdog::Scope wait("guest-condition", reinterpret_cast<uint64_t>(cond_value),
+	                         reinterpret_cast<uint64_t>(mutex_value));
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -2960,26 +3109,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
-	while (!ready()) {
-		const auto now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			break;
-		}
-
-		const auto remaining = deadline - now;
-		const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-		                            ? remaining
-		                            : std::chrono::steady_clock::duration(
-		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		thread->cond_cv.wait_for(cond_lock, poll);
-
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
-		}
-	}
-
+	CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 	result = (ready() ? OK : ETIMEDOUT);
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
@@ -3022,6 +3152,8 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return KERNEL_ERROR_EPERM;
 	}
 
+	HangWatchdog::Scope wait("guest-condition", reinterpret_cast<uint64_t>(cond_value),
+	                         reinterpret_cast<uint64_t>(mutex_value));
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3072,6 +3204,7 @@ Pthread PthreadSelfOrNull() {
 Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	auto* previous = g_pthread_self;
 	g_pthread_self = thread;
+	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), {});
 	return previous;
 }
 
@@ -3117,6 +3250,21 @@ bool PthreadTakePendingSignal(Pthread thread, int signum) {
 	return (thread->pending_signal_mask.fetch_and(~mask, std::memory_order_acq_rel) & mask) != 0;
 }
 
+int PthreadTakeLowestPendingSignal(Pthread thread, int limit) {
+	if (thread == nullptr) {
+		return -1;
+	}
+	return TakeLowestPendingSignal(thread->pending_signal_mask, limit);
+}
+
+bool GuestSchedLegacy() {
+	static const bool legacy = [] {
+		const auto* value = std::getenv("KYTY_GUEST_SCHED");
+		return value != nullptr && std::strcmp(value, "legacy") == 0;
+	}();
+	return legacy;
+}
+
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size) {
 	if (thread == nullptr || thread->attr == nullptr || stack_addr == nullptr ||
 	    stack_size == nullptr) {
@@ -3134,25 +3282,20 @@ bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_
 	return true;
 }
 
+/// Priority class (256, 700 or 767) of a guest thread as the kernel objects use it to order their
+/// waiters. It follows the guest's own priority, not the host step the thread runs at. Returns 700
+/// when the thread is unknown and on every platform but Windows.
 int PthreadGetPriorityForKernel(Pthread thread) {
-	if (thread == nullptr) {
+	if (thread == nullptr || thread->attr == nullptr) {
 		return 700;
 	}
 
-	sched_param param {};
-	int         pol = 0;
-
-	if (pthread_getschedparam(thread->p, &pol, &param) != 0) {
-		return 700;
-	}
-
-	if (param.sched_priority <= -2) {
-		return 767;
-	}
-	if (param.sched_priority >= +2) {
-		return 256;
-	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The class of the priority the guest asked for, whatever host step the thread runs at.
+	return HostPriorityToGuest(GuestPriorityToHost(thread->attr->guest_priority));
+#else
 	return 700;
+#endif
 }
 
 int PthreadGetCurrentPriorityForKernel() {
@@ -3178,6 +3321,10 @@ static void CleanupThread(void* arg) {
 	thread->almost_done = true;
 }
 
+/// Entry point of the host thread behind every guest thread: records its identity, applies the guest
+/// priority, then runs the guest entry function on the guest stack and cleans up afterwards.
+/// @param arg the Pthread that this host thread runs
+/// @return the value the guest entry function returned
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -3192,6 +3339,7 @@ static void* RunThread(void* arg) {
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
 	g_pthread_self = thread;
+	HangWatchdog::SetGuestThread(reinterpret_cast<uint64_t>(thread), thread->name);
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3200,16 +3348,15 @@ static void* RunThread(void* arg) {
 	os_thread_id = GetHostThreadId();
 #endif
 	thread->host_thread_id = os_thread_id;
-#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-	if (!thread->name.empty()) {
-#if defined(__APPLE__)
-		pthread_setname_np(thread->name.substr(0, 63).c_str());
-#else
-		pthread_setname_np(pthread_self(), thread->name.substr(0, 15).c_str());
-#endif
-	}
-#endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Apply the guest's priority to this thread directly. The attribute carries it as well, but
+	// PthreadAttrSetinheritsched deliberately keeps inherit_sched out of the native attribute, so
+	// whether winpthreads honours the attribute at creation is not ours to rely on.
+	thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);
+	SetThreadPriority(GetCurrentThread(),
+	                  GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));
+#endif
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
 	     thread->name.c_str(), thread->unique_id, os_thread_id,
@@ -3334,6 +3481,8 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	HangWatchdog::Scope wait("guest-thread-join", reinterpret_cast<uint64_t>(thread),
+	                         thread->host_thread_id);
 	int result = pthread_join(thread->p, value);
 
 	if (PRINT_NAME_ENABLED) {
@@ -3477,6 +3626,8 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 	return OK;
 }
 
+/// Sets the priority of a guest thread: the guest value is stored and, on Windows, the host priority
+/// of its band is applied, one step lower for a thread that started pinned to a single core.
 int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	PRINT_NAME();
 
@@ -3494,13 +3645,7 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (prio <= 478) {
-		param.sched_priority = +2;
-	} else if (prio >= 733) {
-		param.sched_priority = -2;
-	} else {
-		param.sched_priority = 0;
-	}
+	param.sched_priority = GuestThreadHostPriority(prio, thread->core_bound);
 
 	if (pthread_setschedparam(thread->p, pol, &param) != 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -3609,6 +3754,11 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 }
 
 void KYTY_SYSV_ABI PthreadYield() {
+	// Placement samples of spinning guest threads (the fence poller), every 4096th yield.
+	static thread_local uint32_t placement_yields = 0;
+	if ((++placement_yields & 4095u) == 0u) {
+		Common::SamplePlacement(Common::ThreadRole::Guest);
+	}
 	SchedulerBackoffOnce();
 }
 
@@ -3840,6 +3990,8 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	// usleep(0) returns at once, as FreeBSD's nanosleep does for a zero time, after the pending
+	// signal check a system call return makes (SleepMicroWithSignalPoll).
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }

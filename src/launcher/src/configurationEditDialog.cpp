@@ -19,7 +19,6 @@
 #include <QLineEdit>
 #include <QListView>
 #include <QListWidget>
-#include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
@@ -125,14 +124,45 @@ static QString GameDirectoryKey(const QString& dir) {
 #endif
 }
 
+// The audio mix sliders (rows 1-4 of the Audio group) are global settings like the controller
+// group: shown only in the global settings dialog.
+struct AudioMixSlider {
+	QSlider* slider;
+	QLabel*  value;
+	int AudioMixSettings::*field;
+};
+
+static std::array<AudioMixSlider, 4> AudioMixSliders(Ui::ConfigurationEditDialog& ui) {
+	return {{{ui.slider_audio_master, ui.label_audio_master_value, &AudioMixSettings::master},
+	         {ui.slider_audio_main, ui.label_audio_main_value, &AudioMixSettings::main},
+	         {ui.slider_audio_music, ui.label_audio_music_value, &AudioMixSettings::music},
+	         {ui.slider_audio_pad_speaker, ui.label_audio_pad_speaker_value,
+	          &AudioMixSettings::pad_speaker}}};
+}
+
+static void SetAudioMixVisible(Ui::ConfigurationEditDialog& ui, bool visible) {
+	for (int row = 1; row <= 4; row++) {
+		ui.audioLayout->setRowVisible(row, visible);
+	}
+	// The occlusion mode is global too (graphics row 9).
+	ui.graphicsLayout->setRowVisible(ui.checkBox_gpu_occlusion, visible);
+}
+
 ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* parent)
     : QDialog(parent, Qt::WindowCloseButtonHint), m_ui(new Ui::ConfigurationEditDialog),
       m_info(info) {
 	m_ui->setupUi(this);
+	SetAudioMixVisible(*m_ui, false);
+	for (const auto& mix: AudioMixSliders(*m_ui)) {
+		mix.slider->setMaximum(static_cast<int>(Config::MAX_AUDIO_VOLUME));
+		connect(mix.slider, &QSlider::valueChanged, this,
+		        [label = mix.value](int value) {
+			label->setText(ConfigurationEditDialog::tr("%1%").arg(value));
+		});
+	}
 	setMinimumWidth(width());
 	InitGameDirectories();
 	m_ui->controller_group->setVisible(false);
-	m_ui->settings_button->setVisible(false);
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
@@ -233,6 +263,10 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	UpdateControllerColorButton(m_ui->button_controller_color, info.controller.color);
 	m_ui->slider_controller_vibration->setValue(info.controller.vibration_intensity);
 	m_ui->slider_controller_volume->setValue(info.controller.speaker_volume);
+	for (const auto& mix: AudioMixSliders(*m_ui)) {
+		mix.slider->setValue(info.audio_mix.*mix.field);
+	}
+	m_ui->checkBox_gpu_occlusion->setChecked(info.gpu_occlusion_accurate);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -309,9 +343,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
-	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
-	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
@@ -467,11 +499,6 @@ void ConfigurationEditDialog::InitGameDirectories() {
 
 void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	m_global_settings = true;
-	auto* menu        = new QMenu(m_ui->settings_button);
-	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
-	menu->addAction(tr("Export..."), this, &ConfigurationEditDialog::ExportGameSettings);
-	m_ui->settings_button->setMenu(menu);
-	m_ui->settings_button->setVisible(true);
 	m_game_dirs_list->clear();
 	m_game_dirs_group->setMinimumWidth(GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH);
 
@@ -481,6 +508,7 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 
 	m_game_dirs_group->setVisible(true);
 	m_ui->controller_group->setVisible(true);
+	SetAudioMixVisible(*m_ui, true);
 	update_game_directory_buttons();
 	layout()->activate();
 	resize(size().expandedTo(minimumSizeHint()));
@@ -580,6 +608,10 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		info.controller.color = ui.button_controller_color->property("controllerColor").toString();
 		info.controller.vibration_intensity = ui.slider_controller_vibration->value();
 		info.controller.speaker_volume      = ui.slider_controller_volume->value();
+		for (const auto& mix: AudioMixSliders(ui)) {
+			info.audio_mix.*mix.field = mix.slider->value();
+		}
+		info.gpu_occlusion_accurate = ui.checkBox_gpu_occlusion->isChecked();
 	}
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
@@ -607,9 +639,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
-	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
-	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();

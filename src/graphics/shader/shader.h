@@ -88,7 +88,11 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_vertices         = 0;
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
-	bool     fast_launch          = false;
+	// 1 when the device's X workgroup limit is below its total (RADV: 65,535 in X): a draw with
+	// more groups is split, and the program adds the part's first group, mesh draw dword
+	// IR::PushData::MeshFirstGroupDword, to WorkgroupId.x. 0 (NVIDIA: X equals the total) keeps
+	// the six draw dwords and the program as before.
+	uint32_t split_groups         = 0;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -149,18 +153,13 @@ struct ShaderVertexInputInfo {
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
-	uint32_t           workgroup_counts[3]        = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
-	bool               lds_storage                = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
 	ShaderStageRuntime stage;
 };
-
-enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
-enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
@@ -169,10 +168,13 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_system_input_base         = 0;
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
-	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
+	// First VGPR of the other SPI_PS_INPUT I/J pairs, UINT32_MAX when not enabled.
+	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
+	uint32_t                                       ps_linear_sample_vgpr        = UINT32_MAX;
+	uint32_t                                       ps_linear_center_vgpr        = UINT32_MAX;
+	uint32_t                                       ps_linear_centroid_vgpr      = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
-	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	uint32_t                                       raster_scale_dword           = UINT32_MAX;
@@ -184,14 +186,13 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_front_face                = false;
 	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
-	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
-	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
-	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
+	// Export logical alpha through MRT1 for blending after channel swizzling.
+	bool                                           alpha_blend_source_remap     = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
@@ -212,6 +213,15 @@ inline const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(ShaderType          
 		case ShaderType::Mesh: return &input.vertex->mesh;
 		default: return nullptr;
 	}
+}
+
+// Guest lanes per host invocation: a wave64 workgroup shader on a 32-wide host subgroup runs two
+// lanes (the SPIR-V emitter's halves) in each invocation and branches on the whole wave.
+inline uint32_t ShaderLanesPerInvocation(ShaderType stage, uint32_t wave_size,
+                                         ShaderStageInputInfo input) {
+	const auto* workgroup = ShaderWorkgroupInput(stage, input);
+	return workgroup != nullptr && wave_size == 64u && workgroup->host_subgroup_size == 32u ? 2u
+	                                                                                      : 1u;
 }
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
@@ -316,7 +326,9 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
-uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
+void ShaderUnmapCode(uint64_t addr, uint64_t size);
+// Changes after every shader map update (draw-prep certificates compare it).
+[[nodiscard]] uint64_t ShaderMapGeneration();
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

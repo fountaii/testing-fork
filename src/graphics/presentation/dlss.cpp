@@ -32,6 +32,7 @@ void       ReleaseFeature(const std::shared_ptr<NgxRuntime>& api, GraphicContext
     // OptiScaler's release waits for the whole device. Synchronize both queues
     // with submissions/presentation even when this runs as a deferred callback.
     Common::LockGuard queue_lock(graphics.queue_mutex);
+		graphics.submission_queue.DrainPendingLocked();
     Common::LockGuard present_lock(graphics.present_queue_mutex);
     api->release_feature(feature);
 }

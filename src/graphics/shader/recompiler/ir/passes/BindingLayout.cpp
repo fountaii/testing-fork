@@ -1,10 +1,13 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -15,16 +18,11 @@ namespace {
 	std::abort();
 }
 
-void CollectShaderData(const Program& program, BindingLayout& layout) {
+std::vector<uint32_t> CollectUserData(const Program& program) {
 	std::array<bool, NumScalarRegs> registers {};
-	bool uses_dispatch_threads = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (!inst.HasUses()) {
-				continue;
-			}
-			uses_dispatch_threads |= inst.GetOpcode() == ValueOpcode::GetDispatchThreadExtent;
-			if (inst.GetOpcode() != ValueOpcode::GetUserData) {
+			if (inst.GetOpcode() != ValueOpcode::GetUserData || !inst.HasUses()) {
 				continue;
 			}
 			if (inst.Arg(0).GetType() != Type::ScalarReg) {
@@ -37,16 +35,13 @@ void CollectShaderData(const Program& program, BindingLayout& layout) {
 			registers[index] = true;
 		}
 	}
+	std::vector<uint32_t> result;
 	for (uint32_t index = 0; index < registers.size(); index++) {
 		if (registers[index]) {
-			layout.user_data_registers.push_back(index);
+			result.push_back(index);
 		}
 	}
-	layout.memory_offset_dword = static_cast<uint32_t>(layout.user_data_registers.size());
-	if (uses_dispatch_threads) {
-		layout.dispatch_thread_dword = layout.memory_offset_dword;
-		layout.memory_offset_dword += 3u;
-	}
+	return result;
 }
 
 void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
@@ -54,80 +49,83 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 	layout.descriptors.push_back({kind, std::move(resources)});
 }
 
-} // namespace
-
-SharedMemoryResources CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers) {
-	std::array<bool, ShaderInfo::MaxBuffers> live_buffers {};
-	SharedMemoryResources shared;
+bool UsesGds(const Program& program) {
+	bool uses_gds = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			const auto op = inst.GetOpcode();
-			if (BufferAccessOf(op) == BufferAccess::None &&
-			    SharedAccessOf(op) == SharedAccess::None &&
-			    AddressOpcodeInfoOf(op).access == AddressAccess::None) {
+			if (SharedAccessOf(inst.GetOpcode()) == SharedAccess::None) {
 				continue;
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;
 			if (index >= program.memory_info.size()) {
-				BindingFail("typed shader contains invalid memory metadata");
+				BindingFail("typed shader contains invalid shared-memory metadata");
 			}
-			const auto& memory = program.memory_info[index];
-			if (memory.planning_only) {
-				continue;
+			const auto kind = program.memory_info[index].kind;
+			if (kind != ResourceKind::Lds && kind != ResourceKind::Gds) {
+				BindingFail("typed shader contains invalid shared-memory metadata");
 			}
-			shared.lds |= memory.kind == ResourceKind::FlatLocal;
-			if (SharedAccessOf(op) != SharedAccess::None) {
-				if (memory.kind != ResourceKind::Lds && memory.kind != ResourceKind::Gds) {
-					BindingFail("typed shader contains invalid shared-memory metadata");
-				}
-				shared.gds |= memory.kind == ResourceKind::Gds;
-				shared.lds |= memory.kind == ResourceKind::Lds;
-			} else if (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer) {
-				EXIT_IF(memory.resource >= program.info.buffers.size());
-				live_buffers.at(memory.resource) = true;
-				for (const auto child: program.info.buffers[memory.resource].indirect_resources) {
-					live_buffers.at(child) = true;
-				}
+			uses_gds |= kind == ResourceKind::Gds;
+		}
+	}
+	return uses_gds;
+}
+
+} // namespace
+
+bool UsesBvhNodeCount(const Program& program) {
+	const auto& options = GetCodegenOptions();
+	if (options.rt_node_budget == 0 && !options.rt_node_stats) {
+		return false;
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::BvhIntersectRay) {
+				return true;
 			}
 		}
 	}
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		if (live_buffers.at(i)) {
-			buffers.push_back(i);
+	return false;
+}
+
+bool UsesMipStats(const Program& program) {
+	static const bool enabled = [] {
+		const auto* mode = std::getenv("KYTY_LOD_STATS_MODE");
+		return mode == nullptr || mode[0] == 0 || std::strcmp(mode, "gpu") == 0;
+	}();
+	if (!enabled || program.stage != ShaderType::Pixel || program.info.images.empty()) {
+		return false;
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
+				return true;
+			}
 		}
 	}
-	return shared;
+	return false;
 }
 
-bool UsesFlattenedSrt(const Program& program) {
-	const auto uses_mapping = [](const auto& resource) {
-		return resource.indirect_root != UINT32_MAX;
-	};
-	return std::ranges::any_of(program.blocks, [](const Block* block) {
-		return std::ranges::any_of(*block, [](const Inst& inst) {
-			return inst.GetOpcode() == ValueOpcode::ReadConst;
-		});
-	}) || std::ranges::any_of(program.info.buffers, uses_mapping) ||
-	       std::ranges::any_of(program.info.images, uses_mapping);
-}
-
-void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {
+void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
 		                                             : "binding layout already allocated");
 	}
 	BindingLayout next;
-	std::vector<uint32_t> buffers;
-	const auto shared = CollectMemoryResources(program, buffers);
-	CollectShaderData(program, next);
-	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
+	next.user_data_registers = CollectUserData(program);
+	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
+	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	const bool mip_stats     = UsesMipStats(program);
+	next.mip_stats_count     = mip_stats ? static_cast<uint32_t>(program.info.images.size()) : 0u;
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
-	if (!buffers.empty()) {
-		// Draw binding accesses this first group directly when memory_offset_count is nonzero.
-		AddBinding(next, DescriptorBindingKind::Buffers, std::move(buffers));
+	if (!program.info.buffers.empty()) {
+		std::vector<uint32_t> resources(program.info.buffers.size());
+		for (uint32_t i = 0; i < resources.size(); i++) {
+			resources[i] = i;
+		}
+		AddBinding(next, DescriptorBindingKind::Buffers, std::move(resources));
 	}
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;
@@ -163,22 +161,28 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	if (shared.gds) {
+	// KYTY_LOOP_GUARD and the BVH node count report through GDS, so those programs bind GDS.
+	if (UsesGds(program) || LoopGuardApplies(program.shader_hash) || UsesBvhNodeCount(program)) {
 		AddBinding(next, DescriptorBindingKind::Gds);
-	}
-	if (shared.lds && lds_storage) {
-		AddBinding(next, DescriptorBindingKind::SharedMemory);
 	}
 	if (program.info.uses_dma) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
-	if (UsesFlattenedSrt(program)) {
+	const bool uses_flattened_runtime =
+	    !program.srt_reads.empty() ||
+	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		    return image.indirect_search_iterations != 0u;
+	    });
+	if (uses_flattened_runtime) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 
 	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
 		AddBinding(next, DescriptorBindingKind::ShaderData);
+	}
+	if (mip_stats) {
+		AddBinding(next, DescriptorBindingKind::MipStats);
 	}
 
 	program.bindings                = std::move(next);

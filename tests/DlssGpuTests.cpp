@@ -108,7 +108,7 @@ void PresentationQueueCase(GraphicContext& graphics, RenderContext& renderer) {
 		return;
 	}
 	auto&            producer = renderer.GetCommandScheduler();
-	CommandScheduler presentation(renderer, graphics, true);
+	CommandScheduler presentation(renderer, graphics, CommandScheduler::Role::Presenter);
 	HW::Context      registers {};
 	HW::UserConfig   user {};
 	HW::Shader       shaders {};
@@ -991,20 +991,25 @@ void GeometryMotionCase(GraphicContext& graphics, RenderContext& renderer) {
 	std::array<Prospero::ColorComponentMapping, 8> mapping {};
 	std::array<ShaderVertexInputInfo, 3>           vertex_inputs {};
 	ShaderPixelInputInfo                           pixel_inputs {};
-	auto                                           programs = [&](bool enable) {
-        return renderer.GetPipelineCache().GetGraphicsPrograms(
-            vertex_regs, pixel_regs, registers.GetShaderRegisters(), registers, user, mapping, true,
-            vertex_inputs, pixel_inputs, enable);
-	};
-	const auto native = programs(true);
-	Check(vertex_inputs[0].geometry_motion_dword == 0 && pixel_inputs.geometry_motion_dword == 0,
-	      "production shader cache did not enable geometry capture");
-	const auto ordinary = programs(false);
-	Check(vertex_inputs[0].geometry_motion_dword == UINT32_MAX &&
-	          pixel_inputs.geometry_motion_dword == UINT32_MAX &&
-	          ordinary.vertex[0].id != native.vertex[0].id && ordinary.pixel.id != native.pixel.id,
-	      "instrumented shader permutation leaked into ordinary guest draws");
-	Check(programs(true).vertex[0].id == native.vertex[0].id,
+	PipelineCache::GraphicsStagePreps stage_preps;
+        auto programs = [&](bool enable) {
+          return renderer.GetPipelineCache().GetGraphicsPrograms(
+              vertex_regs, pixel_regs, registers.GetShaderRegisters(),
+              registers, user, mapping, true, vertex_inputs, pixel_inputs,
+              stage_preps, enable);
+        };
+        const auto native = programs(true);
+        Check(vertex_inputs[0].geometry_motion_dword == 0 &&
+                  pixel_inputs.geometry_motion_dword == 0,
+              "production shader cache did not enable geometry capture");
+        const auto ordinary = programs(false);
+        Check(
+            vertex_inputs[0].geometry_motion_dword == UINT32_MAX &&
+                pixel_inputs.geometry_motion_dword == UINT32_MAX &&
+                ordinary.vertex[0].id != native.vertex[0].id &&
+                ordinary.pixel.id != native.pixel.id,
+            "instrumented shader permutation leaked into ordinary guest draws");
+        Check(programs(true).vertex[0].id == native.vertex[0].id,
 	      "geometry shader cache failed to reuse its native permutation");
 	auto occupied_code = vertex_code;
 	occupied_code.insert(occupied_code.end() - 1, {0xf8000bafu, 0x04030201u}); // guest parameter 26
@@ -2090,7 +2095,7 @@ int main(int argc, char** argv) {
 	queue.queueFamilyIndex = graphics.queue_family;
 	queue.queueCount       = graphics.present_queue_index + 1;
 	queue.pQueuePriorities = priorities.data();
-	auto features11        = WindowContext::RequiredVulkan11Features();
+	vk::PhysicalDeviceVulkan11Features features11 {};
 	auto features12        = WindowContext::RequiredVulkan12Features();
 	if (optiscaler) {
 		vk::PhysicalDeviceVulkan12Features supported12 {};
@@ -2127,7 +2132,8 @@ int main(int argc, char** argv) {
 	                         &graphics.present_queue);
 	Check(graphics.CreateAllocator(), "VMA initialization");
 	{
-		RenderContext renderer(graphics);
+		auto renderer_owner = std::make_unique<RenderContext>(graphics);
+		auto& renderer = *renderer_owner;
 		if (optiscaler_fg_gpu) {
 			HW::Context    registers {};
 			HW::UserConfig user {};

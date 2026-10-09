@@ -529,6 +529,7 @@ bool XessFgBridge::RecordInputs(vk::CommandBuffer command, Image& depth, Image& 
 		state.WaitD3d12();
 		{
 			Common::LockGuard queue_lock(state.graphics.queue_mutex);
+		state.graphics.submission_queue.DrainPendingLocked();
 			Common::LockGuard present_lock(state.graphics.present_queue_mutex);
 			RequireVulkanSuccess(state.graphics.device.waitIdle(), "retire XeSS-FG inputs");
 		}

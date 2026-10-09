@@ -24,8 +24,6 @@ struct Lifecycle {
 using callback_func_t = void (*)(uintptr_t addr, size_t size);
 
 constexpr uint32_t KERNEL_MAXIMUM_NAME_LENGTH = 32;
-constexpr uint64_t kExtendedMemoryBase       = 0x080000000000ull;
-constexpr uint64_t kExtendedMemorySize       = 512ull * 1024 * 1024 * 1024;
 
 struct VirtualQueryInfo {
 	uintptr_t start;
@@ -109,14 +107,55 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
 void                   SetFlexibleMemorySize(uint64_t size);
-int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
-                         int memory_type, int64_t* phys_addr_out, bool automatic = false);
-int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+// TryReadBacking whose destination may hold partial bytes when it fails (the caller discards it
+// then): any size through a per-thread mapping record, without the mapping lock (see
+// GuestBackingStore::TryReadBackingDirect). Any thread.
+bool                   TryReadBackingDirect(uint64_t vaddr, void* data, uint64_t size);
+// The direct-memory backing alias of [vaddr, vaddr + size) when one mapping holds the whole range,
+// or nullptr (not direct memory, or spanning mappings). The alias stays mapped and writable for
+// the process lifetime: reading it never faults, whatever the guest view's protection, and after
+// the guest unmaps the range it shows whatever that backing then holds. Any thread.
+[[nodiscard]] const void* GuestBackingAlias(uint64_t vaddr, uint64_t size);
+bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// TryReadGpuCleanBacking that also returns the XXH3-64 digest of the bytes read. Inside a
+// draw-prep preparation the read is certified by that digest instead of its bytes
+// (DrawPrep::ReadSet::RecordDigest): only for bytes the preparation merely hashes.
+bool TryReadGpuCleanBackingDigest(uint64_t vaddr, void* data, uint64_t size, uint64_t& digest);
+// In-place variants (KYTY_BACKING_INPLACE, default on): the same clean gate as
+// TryReadGpuCleanBacking, then the backing bytes are compared or hashed where they are, through a
+// lock-free mapping lookup, instead of being copied into a destination first. The bytes seen are
+// exactly those a TryReadGpuCleanBacking at the same moment would have returned.
+[[nodiscard]] bool BackingInPlaceEnabled();
+enum class BackingCompare : uint8_t { Unavailable, Equal, Different };
+struct InPlaceStats {
+	uint32_t inspected = 0; // ranges inspected in place
+	uint32_t locked    = 0; // of those, inspected under the mapping lock
+};
+// Outside draw-prep preparations only (no active recorder). Unavailable when the range is not
+// clean for a backing read or has no backing.
+[[nodiscard]] BackingCompare CompareGpuCleanBacking(uint64_t vaddr, const void* expected,
+                                                    uint64_t size, InPlaceStats* stats = nullptr);
+// The XXH3-64 digest of the clean backing bytes. Inside a draw-prep preparation the read is gated
+// and certified by that digest exactly as TryReadGpuCleanBackingDigest does, without a copy.
+bool HashGpuCleanBacking(uint64_t vaddr, uint64_t size, uint64_t& digest,
+                         InPlaceStats* stats = nullptr);
+// The clean verdict of TryReadGpuCleanBacking without reading bytes (GPU thread; true for
+// ranges outside GPU memory).
+[[nodiscard]] bool     IsGpuCleanForRead(uint64_t vaddr, uint64_t size);
+// Whether [vaddr, vaddr + size) lies in guest memory mapped for the GPU (the renderer's mapped
+// ranges, the same ones its fault handler resolves). False before InstallGpuResources.
+[[nodiscard]] bool     IsGpuMapped(uint64_t vaddr, uint64_t size);
+// May submit/wait only at GPU preparation boundaries, outside texture-cache/tracker locks.
+bool                   SynchronizeGpuBackingForRead(uint64_t vaddr, uint64_t size);
+bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// ClampRangeSize's answer without its log or exit (0: not committed, or no ranges yet). Any thread.
+[[nodiscard]] uint64_t ClampRangeSizeQuiet(uint64_t vaddr, uint64_t size);
+// The guest virtual ranges' change generation (advanced before every change starts; 0 before
+// they exist). Unchanged since a read made before a ClampRangeSize call: the call's answer holds.
+[[nodiscard]] uint64_t VirtualRangesGeneration() noexcept;
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
@@ -191,8 +230,15 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-void     TestBeforeNextBackingMap(callback_func_t callback);
-void     TestSetBackingReadCallback(callback_func_t callback);
+// KYTY_CLAMP_RANGE_MEMO outcomes of the calling thread's ClampRangeSize calls.
+struct TestClampTotals {
+	uint64_t hits              = 0;
+	uint64_t misses            = 0;
+	uint64_t verify_checks     = 0;
+	uint64_t verify_mismatches = 0;
+	uint64_t verify_races      = 0;
+};
+TestClampTotals TestClampRangeMemoTotals();
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
@@ -202,6 +248,7 @@ bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
+uint64_t TestGuestBackingBase();
 bool     TestGuestFreeRangeBounds();
 #endif
 

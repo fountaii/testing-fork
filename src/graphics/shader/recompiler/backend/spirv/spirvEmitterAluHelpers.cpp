@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -100,7 +101,27 @@ uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	return ret;
 }
 
+// KYTY_SHORT_F32_HELPERS (from BryanKAdams/KytyPS5 5e22481): OpIsNan holds for every NaN
+// encoding, signaling ones included, and is one instruction where the exponent and mantissa tests
+// take five. The module preserves NaNs (the fast min/max path relies on OpIsNan the same way).
+static bool ShortF32Helpers() {
+	return GetCodegenOptions().short_f32_helpers;
+}
+
+static F32Class EmitClassifyF32Value(EmitterState& state, uint32_t value, uint32_t bits) {
+	F32Class cls;
+	cls.bits = bits;
+	cls.nan  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIsNan, TypeBool(state), cls.nan, value);
+	cls.zero = EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, bits, 0x7fffffffu),
+	                                  0);
+	return cls;
+}
+
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
+	if (ShortF32Helpers()) {
+		return EmitClassifyF32Value(state, EmitBitcastU32ToF32(state, bits), bits);
+	}
 	F32Class cls;
 	cls.bits                 = bits;
 	const auto abs_bits      = EmitAndConstant(state, cls.bits, 0x7fffffffu);
@@ -115,6 +136,9 @@ F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 }
 
 F32Class EmitClassifyF32(EmitterState& state, uint32_t value) {
+	if (ShortF32Helpers()) {
+		return EmitClassifyF32Value(state, value, EmitBitcastF32ToU32(state, value));
+	}
 	return EmitClassifyF32Bits(state, EmitBitcastF32ToU32(state, value));
 }
 
@@ -125,23 +149,20 @@ uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
 	return EmitLogicalAndBool(state, selected, class_match);
 }
 
-static uint32_t EmitClassMaskBits(EmitterState& state, uint32_t bits, uint32_t mask, bool half) {
-	const uint32_t sign_mask     = half ? 0x8000u : 0x80000000u;
-	const uint32_t exponent_mask = half ? 0x7c00u : 0x7f800000u;
-	const uint32_t mantissa_mask = half ? 0x03ffu : 0x007fffffu;
-	const uint32_t quiet_mask    = half ? 0x0200u : 0x00400000u;
-	const auto     sign_bits     = EmitAndConstant(state, bits, sign_mask);
-	const auto     abs_bits      = EmitAndConstant(state, bits, sign_mask - 1u);
-	const auto     exponent_bits = EmitAndConstant(state, abs_bits, exponent_mask);
-	const auto     mantissa_bits = EmitAndConstant(state, abs_bits, mantissa_mask);
-	const auto     quiet_bits    = EmitAndConstant(state, mantissa_bits, quiet_mask);
+uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
+	const auto bits          = EmitBitcastF32ToU32(state, value);
+	const auto sign_bits     = EmitAndConstant(state, bits, 0x80000000u);
+	const auto abs_bits      = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
+	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
+	const auto quiet_bits    = EmitAndConstant(state, mantissa_bits, 0x00400000u);
 
 	const auto sign             = EmitCompareU32Constant(state, spv::OpINotEqual, sign_bits, 0);
 	const auto positive         = EmitLogicalNotBool(state, sign);
 	const auto exponent_zero    = EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0);
 	const auto exponent_nonzero = EmitLogicalNotBool(state, exponent_zero);
 	const auto exponent_inf =
-	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, exponent_mask);
+	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0x7f800000u);
 	const auto finite_exponent  = EmitLogicalNotBool(state, exponent_inf);
 	const auto mantissa_zero    = EmitCompareU32Constant(state, spv::OpIEqual, mantissa_bits, 0);
 	const auto mantissa_nonzero = EmitLogicalNotBool(state, mantissa_zero);
@@ -181,14 +202,6 @@ static uint32_t EmitClassMaskBits(EmitterState& state, uint32_t bits, uint32_t m
 	    EmitClassMaskBitMatch(state, mask, 9, EmitLogicalAndBool(state, inf, positive)));
 }
 
-uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
-	return EmitClassMaskBits(state, EmitBitcastF32ToU32(state, value), mask, false);
-}
-
-uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
-	return EmitClassMaskBits(state, bits, mask, true);
-}
-
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
 	const auto lhs_class = EmitClassifyF32(state, lhs);
 	const auto rhs_class = EmitClassifyF32(state, rhs);
@@ -211,10 +224,12 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	// A zero is its own sign bits, so "magnitude below the smallest normal" needs no separate
+	// non-zero test: selecting the sign bits of +-0 returns +-0 unchanged.
 	const auto bits      = state.builder.AllocateId();
 	const auto abs_bits  = state.builder.AllocateId();
 	const auto sign_bits = state.builder.AllocateId();
-	const auto subnormal = state.builder.AllocateId();
+	const auto flush     = state.builder.AllocateId();
 	const auto selected  = state.builder.AllocateId();
 	const auto ret       = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
@@ -222,14 +237,17 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	                          ConstantU32(state, 0x7fffffffu));
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), sign_bits, bits,
 	                          ConstantU32(state, 0x80000000u));
-	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), subnormal, abs_bits,
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), flush, abs_bits,
 	                          ConstantU32(state, 0x00800000u));
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, subnormal, sign_bits, bits);
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, flush, sign_bits, bits);
 	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), ret, selected);
 	return ret;
 }
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {
+	// The |x| >= 2^23 select stays, also with KYTY_SHORT_F32_HELPERS: such finite values are whole
+	// numbers, but the RTX 3090's Fract of -FLT_MAX is not +0 (sin/cos read NaN without the select,
+	// VectorSinCosMaxFiniteSpecialCases), so the select is not redundant on every host.
 	const auto fract        = state.builder.AllocateId();
 	const auto bits         = state.builder.AllocateId();
 	const auto abs_bits     = state.builder.AllocateId();

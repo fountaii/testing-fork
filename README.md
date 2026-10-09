@@ -1,4 +1,17 @@
-# KytyPS5
+# KytyPS5 experimental
+
+The main branch contains the U59 renderer, the validated Demon's Souls shader and
+compatibility changes, and the U59 integration work: command-processor and VRAM
+improvements, profile-guided optimization, and upstream's newer changes. No 60 FPS
+result is claimed.
+
+- [U59 feature changes and performance evidence](docs/CHANGES-U59.md)
+- [Fork commit and file catalog through U59](docs/CHANGE-CATALOG.md)
+- [Current release: what is new, launch and build guide](docs/EXPERIMENTAL.md)
+
+This fork retains sanitized development history and upstream attribution.
+The badges and general project description below refer to upstream. Packaged
+Windows builds are available under Releases.
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Linux%29&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
@@ -141,8 +154,7 @@ the Vulkan/SPIR-V validation rules.
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
 - Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslang` or `glslangValidator`) on `PATH`
-- Python 3 on `PATH`; the bundled SPIRV-Tools runs it at configure time
+- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslangValidator`) on `PATH`
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 
@@ -185,7 +197,7 @@ build has no working sound and no gamepad hotplug:
 
 ```bash
 sudo apt-get install --no-install-recommends \
-  clang lld ninja-build cmake git glslang-tools python3 pkg-config \
+  clang lld ninja-build cmake git glslang-tools pkg-config \
   libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
   libxi-dev libxrandr-dev libxss-dev libxtst-dev libxkbcommon-dev \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
@@ -260,7 +272,7 @@ Requirements:
 
 - An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
 - Xcode (or the Command Line Tools)
-- Homebrew packages: `brew install cmake ninja glslang python`
+- Homebrew packages: `brew install cmake ninja glslang`
 - Qt 6 (Concurrent, Network, Widgets) with x86-64 support. The official Qt installation is
   universal and works; Homebrew's Qt is arm64-only and will not link
 

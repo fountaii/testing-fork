@@ -12,24 +12,25 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 
 namespace Libs::Graphics {
 
-enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
-
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
 
-enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
+enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };
 
 struct ImageMetadataInfo {
 	GuestRange          range;
-	ImageMetadataKind   kind                 = ImageMetadataKind::None;
-	uint32_t            control              = 0;
-	uint32_t            clear_word           = 0;
-	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
-	bool                stencil_compressed   = false;
-	bool                clear_register_valid = false;
-	bool                dcc_alpha_msb        = true;
+	ImageMetadataKind   kind               = ImageMetadataKind::None;
+	uint32_t            control            = 0;
+	uint32_t            dcc_clear_word           = 0;
+	uint32_t            dcc_clear_word1          = 0; // CB_COLORn_CLEAR_WORD1 (texel bits 32..63)
+	VideoOutCompression compression        = VideoOutCompression::Uncompressed;
+	bool                stencil_compressed = false;
+	bool                dcc_clear_register_valid = false;
+	bool                dcc_alpha_msb            = true;
 };
 
 struct ImageSubresources {
@@ -72,14 +73,6 @@ struct ImageInfo {
 	bool                         bgra16          = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
 
-	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
-		if (bgra16) return ColorTransform::SwapBgra16;
-		switch (guest_format) {
-			case Prospero::BufferFormat::k10_11_11Float:
-				return ColorTransform::Reverse10_11_11;
-			default: return ColorTransform::None;
-		}
-	}
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {
 		return metadata.kind != ImageMetadataKind::None;
@@ -101,8 +94,7 @@ struct ImageInfo {
 	}
 	[[nodiscard]] bool IsCompatible(const ImageInfo& other) const noexcept {
 		return pixel_format == other.pixel_format && samples == other.samples &&
-		       bytes_per_block == other.bytes_per_block &&
-		       GetColorTransform() == other.GetColorTransform();
+		       bytes_per_block == other.bytes_per_block;
 	}
 	[[nodiscard]] int32_t MipOf(const ImageInfo& container) const noexcept {
 		if (container.resources.levels > container.mip_layout.size()) {
@@ -390,28 +382,7 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
-	const auto float16 = [](uint32_t value) {
-		const auto sign = (value & 0x8000u) << 16u;
-		const auto exponent = (value >> 10u) & 0x1fu;
-		const auto mantissa = value & 0x3ffu;
-		if (exponent == 0) {
-			return std::copysign(static_cast<float>(mantissa) * 0x1p-24f,
-			                     std::bit_cast<float>(sign));
-		}
-		return std::bit_cast<float>(sign | ((exponent == 31 ? 255u : exponent + 112u) << 23u) |
-		                            (mantissa << 13u));
-	};
 	switch (format) {
-		case vk::Format::eR16G16Sfloat:
-			next.float32[1] = float16(packed >> 16u);
-			[[fallthrough]];
-		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
-		case vk::Format::eR16G16Unorm:
-			next.float32[1] = static_cast<float>(packed >> 16u) / 65535.0f;
-			[[fallthrough]];
-		case vk::Format::eR16Unorm:
-			next.float32[0] = static_cast<float>(packed & 0xffffu) / 65535.0f;
-			break;
 		// A single-plane float target carries its clear as raw float bits, the same encoding the
 		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
 		// contents.
@@ -460,45 +431,172 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 	return true;
 }
 
+// KYTY_CLEAR_REGISTER_WIDE (default 1; 0 restores the old decoding): register clears (DCC key 0x20
+// and CMASK fast clears) of 64-bit targets use CLEAR_WORD1 as well, and 16-bit-channel and
+// B10G11R11 targets are decoded. Without it Astro Bot's galaxy map kept its RGBA16F normal G-buffer
+// uncleared (DCC key 0x20): moving objects left smeared copies that the lighting turned into red
+// ribbons and bands over the nebula.
+[[nodiscard]] inline bool ClearRegisterWideEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CLEAR_REGISTER_WIDE");
+		return value == nullptr || value[0] == '\0' || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// The clear colour of a CMASK fast clear: CB_COLORn_CLEAR_WORD0/1 hold the texel bits of the
+// target format (word0 the low 32 bits). 4-byte formats use word0 as DecodePackedColorClear does;
+// 8-byte formats are decoded per component. Other formats are not decoded.
+[[nodiscard]] inline bool DecodePackedColorClear64(vk::Format format, uint32_t word0,
+                                                   uint32_t word1, vk::ClearColorValue& clear) {
+	const auto half_to_float = [](uint32_t bits) {
+		const uint32_t sign     = (bits & 0x8000u) << 16u;
+		const uint32_t exponent = (bits >> 10u) & 0x1fu;
+		uint32_t       mantissa = bits & 0x3ffu;
+		if (exponent == 0x1fu) {
+			return std::bit_cast<float>(sign | 0x7f800000u | (mantissa << 13u));
+		}
+		if (exponent != 0) {
+			return std::bit_cast<float>(sign | ((exponent + 112u) << 23u) | (mantissa << 13u));
+		}
+		if (mantissa == 0) {
+			return std::bit_cast<float>(sign);
+		}
+		// Subnormal half: normalize into a float.
+		uint32_t shift = 0;
+		while ((mantissa & 0x400u) == 0) {
+			mantissa <<= 1u;
+			shift++;
+		}
+		mantissa &= 0x3ffu;
+		return std::bit_cast<float>(sign | ((113u - shift) << 23u) | (mantissa << 13u));
+	};
+	const std::array<uint32_t, 4> halves {word0 & 0xffffu, word0 >> 16u, word1 & 0xffffu,
+	                                      word1 >> 16u};
+	vk::ClearColorValue next {};
+	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat:
+			for (uint32_t i = 0; i < 4; i++) next.float32[i] = half_to_float(halves[i]);
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			for (uint32_t i = 0; i < 4; i++) next.float32[i] = static_cast<float>(halves[i]) / 65535.0f;
+			break;
+		case vk::Format::eR16G16B16A16Uint:
+			for (uint32_t i = 0; i < 4; i++) next.uint32[i] = halves[i];
+			break;
+		case vk::Format::eR16G16B16A16Sint:
+			for (uint32_t i = 0; i < 4; i++) next.int32[i] = static_cast<int16_t>(halves[i]);
+			break;
+		case vk::Format::eR32G32Sfloat:
+			next.float32[0] = std::bit_cast<float>(word0);
+			next.float32[1] = std::bit_cast<float>(word1);
+			break;
+		case vk::Format::eR32G32Uint:
+			next.uint32[0] = word0;
+			next.uint32[1] = word1;
+			break;
+		case vk::Format::eR32G32Sint:
+			next.int32[0] = static_cast<int32_t>(word0);
+			next.int32[1] = static_cast<int32_t>(word1);
+			break;
+		default:
+			if (!ClearRegisterWideEnabled()) {
+				return DecodePackedColorClear(format, word0, clear);
+			}
+			switch (format) {
+				// Channel 0 in the low bits of word0, as for the 4-byte formats above.
+				case vk::Format::eR16Sfloat: next.float32[0] = half_to_float(halves[0]); break;
+				case vk::Format::eR16G16Sfloat:
+					next.float32[0] = half_to_float(halves[0]);
+					next.float32[1] = half_to_float(halves[1]);
+					break;
+				case vk::Format::eR16Unorm: next.float32[0] = static_cast<float>(halves[0]) / 65535.0f; break;
+				case vk::Format::eR16G16Unorm:
+					next.float32[0] = static_cast<float>(halves[0]) / 65535.0f;
+					next.float32[1] = static_cast<float>(halves[1]) / 65535.0f;
+					break;
+				case vk::Format::eR8Unorm: next.float32[0] = static_cast<float>(word0 & 0xffu) / 255.0f; break;
+				case vk::Format::eR8G8Unorm:
+					next.float32[0] = static_cast<float>(word0 & 0xffu) / 255.0f;
+					next.float32[1] = static_cast<float>((word0 >> 8u) & 0xffu) / 255.0f;
+					break;
+				case vk::Format::eB10G11R11UfloatPack32: {
+					// Unsigned 11-bit (5e6m) R and G, 10-bit (5e5m) B, R in the low bits.
+					const auto unsigned_small_float = [](uint32_t bits, uint32_t mantissa_bits) {
+						const uint32_t mantissa = bits & ((1u << mantissa_bits) - 1u);
+						const uint32_t exponent = bits >> mantissa_bits;
+						if (exponent == 0x1fu) {
+							return mantissa != 0 ? std::numeric_limits<float>::quiet_NaN()
+							                     : std::numeric_limits<float>::infinity();
+						}
+						const auto m = static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits);
+						return exponent == 0 ? std::ldexp(m, -14) : std::ldexp(1.0f + m, static_cast<int>(exponent) - 15);
+					};
+					next.float32[0] = unsigned_small_float(word0 & 0x7ffu, 6);
+					next.float32[1] = unsigned_small_float((word0 >> 11u) & 0x7ffu, 6);
+					next.float32[2] = unsigned_small_float(word0 >> 22u, 5);
+					next.float32[3] = 1.0f;
+					break;
+				}
+				default: return DecodePackedColorClear(format, word0, clear);
+			}
+			break;
+	}
+	clear = next;
+	return true;
+}
+
 // Unlike a register clear, a DWORD fill repeats the same word across the entire pixel.
 // Keep this separate: the first register word alone cannot describe a 64-bit color.
-// A uniform 32-bit fill as an image clear: a 32-bit texel is the packed clear, a 64- or
-// 128-bit texel holds the word in each 32-bit part. A clear cannot keep an infinity or NaN
-// bit pattern, so those fills stay buffer writes.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
-	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm) &&
-	    (packed & 0xffffu) != (packed >> 16u)) return false;
+	if (format == vk::Format::eR16G16B16A16Sfloat) {
+		if (packed != 0) {
+			return false;
+		}
+		clear = vk::ClearColorValue {};
+		return true;
+	}
+	return DecodePackedColorClear(format, packed, clear);
+}
+
+// KYTY_WIDE_FILL_CLEAR=1 (default off; ported from chenxiao07/KytyPS5 e6b7fb0b1): the clear of a
+// texel whose memory a uniform fill wrote with one 32-bit word. A 32-bit texel is the packed clear
+// above, a 64- or 128-bit one holds the word in each of its 32-bit parts. A NaN or infinity
+// pattern keeps the dispatch (a clear does not keep it).
+[[nodiscard]] inline bool DecodeFilledColorClear(vk::Format format, uint32_t word,
+                                                 vk::ClearColorValue& clear) {
 	const auto half = [](uint32_t bits) {
 		const uint32_t exponent = (bits >> 10u) & 0x1fu;
 		const uint32_t mantissa = bits & 0x3ffu;
-		const float    value =
-		    std::ldexp(static_cast<float>(exponent != 0 ? mantissa | 0x400u : mantissa),
-		               static_cast<int>(std::max(exponent, 1u)) - 25);
+		const float    value    = std::ldexp(
+            static_cast<float>(exponent != 0 ? mantissa | 0x400u : mantissa),
+            static_cast<int>(std::max(exponent, 1u)) - 25);
 		return (bits & 0x8000u) != 0 ? -value : value;
 	};
 	switch (format) {
 		case vk::Format::eR16G16B16A16Sfloat:
-			if ((packed & 0x7c00u) == 0x7c00u || (packed & 0x7c000000u) == 0x7c000000u)
+			if ((word & 0x7c00u) == 0x7c00u || (word & 0x7c000000u) == 0x7c000000u) {
 				return false;
-			clear.float32 =
-			    std::array {half(packed), half(packed >> 16u), half(packed), half(packed >> 16u)};
+			}
+			clear.float32 = std::array {half(word), half(word >> 16u), half(word), half(word >> 16u)};
 			return true;
 		case vk::Format::eR16G16B16A16Uint:
-			clear.uint32 =
-			    std::array {packed & 0xffffu, packed >> 16u, packed & 0xffffu, packed >> 16u};
+			clear.uint32 = std::array {word & 0xffffu, word >> 16u, word & 0xffffu, word >> 16u};
 			return true;
 		case vk::Format::eR32G32Sfloat:
 		case vk::Format::eR32G32B32A32Sfloat:
-			if ((packed & 0x7f800000u) == 0x7f800000u) return false;
-			clear.float32 = std::array {std::bit_cast<float>(packed), std::bit_cast<float>(packed),
-			                            std::bit_cast<float>(packed), std::bit_cast<float>(packed)};
+			if ((word & 0x7f800000u) == 0x7f800000u) {
+				return false;
+			}
+			clear.float32 = std::array {std::bit_cast<float>(word), std::bit_cast<float>(word),
+			                            std::bit_cast<float>(word), std::bit_cast<float>(word)};
 			return true;
 		case vk::Format::eR32G32Uint:
 		case vk::Format::eR32G32B32A32Uint:
-			clear.uint32 = std::array {packed, packed, packed, packed};
+			clear.uint32 = std::array {word, word, word, word};
 			return true;
-		default: return DecodePackedColorClear(format, packed, clear);
+		default: return DecodeColorDwordFill(format, word, clear);
 	}
 }
 

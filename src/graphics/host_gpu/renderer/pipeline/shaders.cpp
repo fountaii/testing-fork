@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineLayoutCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -19,6 +20,8 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <limits>
 #include <span>
 #include <vector>
@@ -95,11 +98,10 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	const auto fmt        = res.Format();
 	const auto raw_format = res.RawFormat();
 	if (raw_format == kTemporaryVertexAttribFormat113) {
-		static bool logged_113 = false;
-		if (!logged_113) {
+		static std::atomic_bool logged_113 = false;
+		if (!logged_113.exchange(true, std::memory_order_relaxed)) {
 			LOGF("InputFormat: temporary: accepting invalid PS5 buffer format 113 as "
 			     "vk::Format::eR32G32B32A32Sfloat\n");
-			logged_113 = true;
 		}
 		format = vk::Format::eR32G32B32A32Sfloat;
 		size   = 4;
@@ -110,10 +112,9 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		return;
 	}
 	if (raw_format == kTemporaryPs5BufferFormat121) {
-		static bool logged_121 = false;
-		if (!logged_121) {
+		static std::atomic_bool logged_121 = false;
+		if (!logged_121.exchange(true, std::memory_order_relaxed)) {
 			LOGF("InputFormat: accepting PS5 buffer format 121 as vk::Format::eR16G16Sfloat\n");
-			logged_121 = true;
 		}
 		format = vk::Format::eR16G16Sfloat;
 		size   = 2;
@@ -123,7 +124,8 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	format = VulkanFormat(fmt);
 	size   = ShaderRecompiler::Format::GetFormatInfo(fmt).component_count;
 	if (format == vk::Format::eUndefined || size == 0) {
-		EXIT("unknown vertex format: fmt = %u\n", raw_format);
+		EXIT("unknown vertex format: fmt = %u descriptor=%08x,%08x,%08x,%08x\n",
+		     raw_format, res.fields[0], res.fields[1], res.fields[2], res.fields[3]);
 	}
 
 	if (NarrowInputFormat(format, size, used_components)) {
@@ -137,14 +139,17 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	}
 }
 
-static vk::BlendFactor GetBlendFactor(uint32_t factor) {
+static vk::BlendFactor GetBlendFactor(uint32_t factor, bool remap_source_alpha) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kZero: return vk::BlendFactor::eZero;
 		case Prospero::BlendFactor::kOne: return vk::BlendFactor::eOne;
 		case Prospero::BlendFactor::kSrcColor: return vk::BlendFactor::eSrcColor;
 		case Prospero::BlendFactor::kOneMinusSrcColor: return vk::BlendFactor::eOneMinusSrcColor;
-		case Prospero::BlendFactor::kSrcAlpha: return vk::BlendFactor::eSrcAlpha;
-		case Prospero::BlendFactor::kOneMinusSrcAlpha: return vk::BlendFactor::eOneMinusSrcAlpha;
+		case Prospero::BlendFactor::kSrcAlpha:
+			return remap_source_alpha ? vk::BlendFactor::eSrc1Color : vk::BlendFactor::eSrcAlpha;
+		case Prospero::BlendFactor::kOneMinusSrcAlpha:
+			return remap_source_alpha ? vk::BlendFactor::eOneMinusSrc1Color
+			                          : vk::BlendFactor::eOneMinusSrcAlpha;
 		case Prospero::BlendFactor::kDstAlpha: return vk::BlendFactor::eDstAlpha;
 		case Prospero::BlendFactor::kOneMinusDstAlpha: return vk::BlendFactor::eOneMinusDstAlpha;
 		case Prospero::BlendFactor::kDstColor: return vk::BlendFactor::eDstColor;
@@ -187,22 +192,18 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
-static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	uint32_t descriptor_count = 0;
-	for (const auto& binding: bindings) {
-		descriptor_count += binding.descriptorCount;
-	}
-	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
-
-	vk::DescriptorSetLayoutCreateInfo create {};
-	create.flags        = pipeline.uses_push_descriptors
-	                          ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-	                          : vk::DescriptorSetLayoutCreateFlags {};
-	create.bindingCount = static_cast<uint32_t>(bindings.size());
-	create.pBindings    = bindings.data();
-	EXIT_IF(graphics.device.createDescriptorSetLayout(
-	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
+// Set 0 plus one push-constant range {push_stages, 0, NativePushConstantSize}; interned by
+// binding signature (pipelineLayoutCache.h, KYTY_LAYOUT_INTERN).
+static void AssignPipelineLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                 std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                 vk::ShaderStageFlags                            push_stages) {
+	EXIT_IF(pipeline.pipeline_layout != nullptr || pipeline.descriptor_set_layout != nullptr);
+	const auto layouts = AcquirePipelineLayout(graphics, bindings, push_stages,
+	                                           ShaderRecompiler::IR::NativePushConstantSize);
+	pipeline.descriptor_set_layout = layouts.set_layout;
+	pipeline.pipeline_layout       = layouts.pipeline_layout;
+	pipeline.uses_push_descriptors = layouts.uses_push_descriptors;
+	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -213,7 +214,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache) {
+                            vk::PipelineCache                      driver_cache,
+                            const GraphicsPipelineCreateHook*      create_hook) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -224,7 +226,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                        rendering.stencil_format != vk::Format::eUndefined;
 	EXIT_IF(!vs_input_info.stage);
 	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
-	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
+	if (mesh && !graphics.mesh_shader_enabled) {
+		ExitWithoutMeshShaders(graphics);
+	}
 	const bool rect_list =
 	    !mesh && !tessellation && static_params.topology == vk::PrimitiveTopology::ePatchList;
 
@@ -273,6 +277,31 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                       .module = pixel_program.module,
 		                                       .pName  = "main"};
 	}
+	// One guest wave per host subgroup where the device lets the stage require it (mesh and
+	// pixel shaders on AMD); GraphicsSubgroupSize and the mesh's host_subgroup_size
+	// (FinishMeshStage) agree. NVIDIA has one subgroup size and chains nothing.
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo stage_subgroup_sizes[4] {};
+	for (uint32_t index = 0; index < shader_stage_count; index++) {
+		auto&      stage   = shader_stages[index];
+		const bool is_mesh = stage.stage == vk::ShaderStageFlagBits::eMeshEXT;
+		if (!is_mesh && (stage.stage != vk::ShaderStageFlagBits::eFragment || !ps_input_info->stage)) {
+			continue;
+		}
+		const auto wave_size = is_mesh ? vs_input_info.mesh.wave_size
+		                               : ps_input_info->stage.program->wave_size;
+		const auto required  = graphics.GraphicsSubgroupSize(stage.stage, wave_size);
+		if (required != 0) {
+			stage_subgroup_sizes[index].requiredSubgroupSize = required;
+			stage.pNext                                      = &stage_subgroup_sizes[index];
+		} else if (wave_size < graphics.subgroup_size) {
+			static std::atomic_bool logged {false};
+			if (!logged.exchange(true)) {
+				LOGF("Vulkan subgroup: wave%u %s shader on a %u-wide host subgroup the device "
+				     "cannot narrow; its lane operations mix two waves\n",
+				     wave_size, is_mesh ? "mesh" : "pixel", graphics.subgroup_size);
+			}
+		}
+	}
 
 	vk::VertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX] {};
 	vk::VertexInputBindingDescription   input_desc[ShaderVertexInputInfo::RES_MAX] {};
@@ -284,18 +313,26 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                    ? vk::VertexInputRate::eInstance
 		                                    : vk::VertexInputRate::eVertex;
 	}
+	uint32_t input_attribute_count = 0;
 	for (uint32_t index = 0; index < vertex_input.attribute_count; index++) {
-		input_attr[index].binding  = vertex_input.attributes[index].binding;
-		input_attr[index].location = index;
-		input_attr[index].offset   = vertex_input.attributes[index].offset;
-
 		uint32_t   attr_size     = 4;
 		const auto registers_num = vs_input_info.resources_dst[index].registers_num;
 		const auto compiled_components =
 		    vs_input_info.stage.program->info.vertex_fetch_components[index];
+		// Embedded fetches with only constant selectors emit no GetAttribute. They need
+		// no native vertex input, including when their unused descriptor format is zero.
+		// Preserve guest locations while compacting the native descriptions: later inputs
+		// must not shift into a constant input's location.
+		if (vs_input_info.fetch_embedded && compiled_components == 0) {
+			continue;
+		}
+		auto& native_attribute     = input_attr[input_attribute_count++];
+		native_attribute.binding  = vertex_input.attributes[index].binding;
+		native_attribute.location = index;
+		native_attribute.offset   = vertex_input.attributes[index].offset;
 		const auto used_components =
 		    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
-		GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
+		GetInputFormat(vs_input_info.resources[index], native_attribute.format, attr_size,
 		               static_cast<uint32_t>(used_components));
 
 		if (graphics_debug_dump_enabled()) {
@@ -305,9 +342,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 				LOGF("VertexInputState[%u]: attr=%u binding=%u offset=%u stride=%u fmt=%d "
 				     "src_fmt=%u dst=v%u regs=%u"
 				     " fetched_components=%u attr_size=%u swizzle=%u,%u,%u,%u\n",
-				     log_id, index, input_attr[index].binding, input_attr[index].offset,
-				     input_desc[input_attr[index].binding].stride,
-				     static_cast<int>(input_attr[index].format),
+				     log_id, index, native_attribute.binding, native_attribute.offset,
+				     input_desc[native_attribute.binding].stride,
+				     static_cast<int>(native_attribute.format),
 				     static_cast<uint32_t>(vs_input_info.resources[index].Format()),
 				     static_cast<uint32_t>(vs_input_info.resources_dst[index].register_start),
 				     static_cast<uint32_t>(registers_num), static_cast<uint32_t>(used_components),
@@ -319,11 +356,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		}
 
 		if (vs_input_info.resources[index].OutOfBounds() != 0) {
-			static bool logged = false;
-			if (!logged) {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
 				LOGF("VertexInput: temporary: accepting PS5 out-of-bounds behavior %" PRIu8 "\n",
 				     vs_input_info.resources[index].OutOfBounds());
-				logged = true;
 			}
 		}
 
@@ -333,7 +369,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineVertexInputStateCreateInfo vertex_input_info {};
 	vertex_input_info.vertexBindingDescriptionCount   = vertex_input.binding_count;
 	vertex_input_info.pVertexBindingDescriptions      = input_desc;
-	vertex_input_info.vertexAttributeDescriptionCount = vertex_input.attribute_count;
+	vertex_input_info.vertexAttributeDescriptionCount = input_attribute_count;
 	vertex_input_info.pVertexAttributeDescriptions    = input_attr;
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
@@ -365,9 +401,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
 	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
 #if !defined(__APPLE__)
-	// The DB clamps depth to the viewport range after polygon offset is applied.
-	rasterizer.depthClampEnable = VK_TRUE;
-	rasterizer.pNext = &clip_ext;
+	// The DB clamps depth to the viewport range after polygon offset is applied; without
+	// VK_EXT_depth_clip_enable the clamp also turns clipping off (DeviceCompat::DepthClampEnable).
+	rasterizer.depthClampEnable = DeviceCompat::DepthClampEnable(graphics.depth_clip_enable_enabled,
+	                                                             static_params.depth_clip_enable)
+	                                  ? VK_TRUE
+	                                  : VK_FALSE;
+	if (graphics.depth_clip_enable_enabled) {
+		rasterizer.pNext = &clip_ext;
+	}
 #endif
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
 	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last &&
@@ -394,18 +436,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		color_blend_attachment[i].colorWriteMask =
 		    vk::ColorComponentFlags {static_params.color_mask[i]};
 		color_blend_attachment[i].blendEnable = static_params.blend_enable[i] ? VK_TRUE : VK_FALSE;
+		// Only target 0 can use the second blend source carrying logical alpha.
+		const bool remap_source_alpha         = i == 0 && static_params.blend_alpha_source_remap;
 		color_blend_attachment[i].srcColorBlendFactor =
-		    GetBlendFactor(static_params.color_srcblend[i]);
+		    GetBlendFactor(static_params.color_srcblend[i], remap_source_alpha);
 		color_blend_attachment[i].dstColorBlendFactor =
-		    GetBlendFactor(static_params.color_destblend[i]);
+		    GetBlendFactor(static_params.color_destblend[i], remap_source_alpha);
 		color_blend_attachment[i].colorBlendOp = GetBlendOp(static_params.color_comb_fcn[i]);
 		color_blend_attachment[i].srcAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_srcblend[i])
+		         ? GetBlendFactor(static_params.alpha_srcblend[i], remap_source_alpha)
 		         : color_blend_attachment[i].srcColorBlendFactor);
 		color_blend_attachment[i].dstAlphaBlendFactor =
 		    (static_params.separate_alpha_blend[i]
-		         ? GetBlendFactor(static_params.alpha_destblend[i])
+		         ? GetBlendFactor(static_params.alpha_destblend[i], remap_source_alpha)
 		         : color_blend_attachment[i].dstColorBlendFactor);
 		color_blend_attachment[i].alphaBlendOp =
 		    (static_params.separate_alpha_blend[i] ? GetBlendOp(static_params.alpha_comb_fcn[i])
@@ -422,11 +466,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	color_write.pColorWriteEnables = color_write_enable;
 
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
-	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
-	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
-#if !defined(__APPLE__)
-	color_blending.pNext = &color_write;
-#endif
+	// Without VK_EXT_color_write_enable (MoltenVK, older drivers) drop the dynamic color-write
+	// struct and rely on each attachment's static colorWriteMask (all channels enabled by default).
+	if (graphics.color_write_enable_enabled) {
+		color_blending.pNext = &color_write;
+	}
 	color_blending.logicOp         = vk::LogicOp::eCopy;
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
@@ -443,34 +487,23 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
 	}
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {graphics_stages, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
-
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push_constants;
-
-	EXIT_IF(pipeline.pipeline_layout != nullptr);
-
+	AssignPipelineLayout(graphics, pipeline, descriptor_bindings, graphics_stages);
 	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
-		     " set_layouts=1 push_constants=%" PRIu32 "\n",
-		     vertex_program.id, ps_active ? pixel_program.id : 0, 1u);
+		LOGF("PipelineTrace: pipeline layout VS=%" PRIu64 " PS=%" PRIu64 " layout=%p push=%d\n",
+		     vertex_program.id, ps_active ? pixel_program.id : 0,
+		     static_cast<void*>(pipeline.pipeline_layout), pipeline.uses_push_descriptors ? 1 : 0);
 	}
-	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                   &pipeline.pipeline_layout);
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
-		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
-	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+	vk::Result result = vk::Result::eSuccess;
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
+	depth_stencil_info.depthBoundsTestEnable =
+#if defined(__APPLE__)
+	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
+#else
+	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
+#endif
+	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
+	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
 
 	std::vector<vk::DynamicState> dynamic_states {
 	    vk::DynamicState::eViewportWithCount,
@@ -488,13 +521,19 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eBlendConstants,
 	};
-#if !defined(__APPLE__)
-	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
-	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
-	if (rendering.color_count != 0) {
+	if (graphics.color_write_enable_enabled && rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
+	if (PipelineDynamicRasterStateEnabled()) {
+		// Core Vulkan 1.3 (no feature bit). The key holds zeroes for these fields; the draw records
+		// the values from the same registers (SetGraphicsDynamicParams).
+		dynamic_states.push_back(vk::DynamicState::eCullMode);
+		dynamic_states.push_back(vk::DynamicState::eFrontFace);
+#if !defined(__APPLE__)
+		dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+		dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 #endif
+	}
 	if (graphics.attachment_feedback_loop_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
@@ -538,8 +577,48 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
+	const auto driver_begin = std::chrono::steady_clock::now();
+	if (create_hook != nullptr) {
+		// The pipeline-library path shares libraries only between identically defined layouts.
+		// Interned (pipelineLayoutCache.h): pipelines with equal canonical signatures get the same
+		// layout handles, so that signature identifies the definition. Not interned: each pipeline
+		// creates its layout from these bindings in this order, so the key keeps the order.
+		std::vector<uint32_t> layout_signature;
+		layout_signature.reserve(descriptor_bindings.size() * 4u + 4u);
+		if (PipelineLayoutInterningEnabled()) {
+			const auto canonical = MakePipelineLayoutSignature(
+			    descriptor_bindings, graphics_stages, ShaderRecompiler::IR::NativePushConstantSize,
+			    graphics.max_push_descriptors);
+			layout_signature.push_back(1u);
+			layout_signature.push_back(canonical.push_descriptors ? 1u : 0u);
+			layout_signature.push_back(canonical.push_stages);
+			layout_signature.push_back(canonical.push_size);
+			for (const auto& binding: canonical.bindings) {
+				layout_signature.insert(layout_signature.end(), binding.begin(), binding.end());
+			}
+		} else {
+			layout_signature.push_back(0u);
+			layout_signature.push_back(pipeline.uses_push_descriptors ? 1u : 0u);
+			layout_signature.push_back(
+			    static_cast<vk::ShaderStageFlags::MaskType>(graphics_stages));
+			layout_signature.push_back(ShaderRecompiler::IR::NativePushConstantSize);
+			for (const auto& binding: descriptor_bindings) {
+				layout_signature.push_back(binding.binding);
+				layout_signature.push_back(static_cast<uint32_t>(binding.descriptorType));
+				layout_signature.push_back(binding.descriptorCount);
+				layout_signature.push_back(
+				    static_cast<vk::ShaderStageFlags::MaskType>(binding.stageFlags));
+			}
+		}
+		result = (*create_hook)(pipeline_info, layout_signature, &pipeline.pipeline);
+	} else {
+		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+		                                                 &pipeline.pipeline);
+	}
+	Profiler::AddFrameWait(Profiler::FrameWait::GraphicsPipelineDriver, 1,
+	                       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                                 std::chrono::steady_clock::now() - driver_begin)
+	                                                 .count()));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -559,7 +638,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            const ComputePipelineCreateHook* create_hook) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -568,37 +648,30 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.module = compute_module;
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
+	// One guest wave per host subgroup: the wave size on AMD, 32 where the driver would otherwise
+	// pick the width (Intel), nothing on NVIDIA (GraphicContext::ComputeSubgroupSize).
 	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
+	const auto required  = graphics.ComputeSubgroupSize(wave_size, input_info.host_subgroup_size);
+	if (required != 0) {
+		comp_subgroup_size.requiredSubgroupSize = required;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
+	} else if (graphics.min_subgroup_size < graphics.max_subgroup_size) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			LOGF("Vulkan subgroup: wave%u compute shader on a device that cannot require its "
+			     "subgroup size (%u to %u); its lane operations may split or mix waves\n",
+			     wave_size, graphics.min_subgroup_size, graphics.max_subgroup_size);
+		}
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
-
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push_constants;
-
-	EXIT_IF(pipeline.pipeline_layout != nullptr);
-
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
-	     1u);
-	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                  &pipeline.pipeline_layout);
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
+	AssignPipelineLayout(graphics, pipeline, descriptor_bindings,
+	                     vk::ShaderStageFlagBits::eCompute);
+	LOGF("PipelineTrace: pipeline layout CS layout=%p push=%d\n",
+	     static_cast<void*>(pipeline.pipeline_layout), pipeline.uses_push_descriptors ? 1 : 0);
+	vk::Result result = vk::Result::eSuccess;
 
 	vk::ComputePipelineCreateInfo info {};
 	info.stage             = comp_shader_stage_info;
@@ -609,8 +682,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	if (create_hook != nullptr) {
+		result = (*create_hook)(info, &pipeline.pipeline);
+	} else {
+		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+		                                                &pipeline.pipeline);
+	}
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

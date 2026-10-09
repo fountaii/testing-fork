@@ -19,7 +19,26 @@ static int KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
 	     "\t mode        = %d\n",
 	     handle, mode);
 
-	return Controller::PadCheckHandle(handle);
+	return 0;
+}
+
+struct PadTriggerEffectStateInformation {
+	int32_t state[2];
+};
+
+static int KYTY_SYSV_ABI PadGetTriggerEffectState(int                               handle,
+                                                  PadTriggerEffectStateInformation* info) {
+	PRINT_NAME();
+
+	LOGF("\t handle = %d\n", handle);
+
+	if (info == nullptr) {
+		return -2137653243; /* 0x80960005 */
+	}
+
+	Controller::GetTriggerEffectState(info->state);
+
+	return 0;
 }
 
 static int KYTY_SYSV_ABI PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool enabled) {
@@ -66,10 +85,11 @@ static int KYTY_SYSV_ABI
 PadDeviceClassGetExtendedInformation(int handle, PadDeviceClassExtendedInformation* info) {
 	PRINT_NAME();
 
-	constexpr int pad_error_invalid_arg = -2137915391; /* 0x80920001 */
+	constexpr int pad_error_invalid_handle = -2137915389; /* 0x80920003 */
+	constexpr int pad_error_invalid_arg    = -2137915391; /* 0x80920001 */
 
-	if (const auto error = Controller::PadCheckHandle(handle); error != OK) {
-		return error;
+	if (handle != 1) {
+		return pad_error_invalid_handle;
 	}
 	if (info == nullptr) {
 		return pad_error_invalid_arg;
@@ -84,15 +104,16 @@ static int KYTY_SYSV_ABI PadDeviceClassParseData(int handle, const Controller::P
                                                  PadDeviceClassData* class_data) {
 	PRINT_NAME();
 
-	constexpr int pad_error_invalid_arg = -2137915391; /* 0x80920001 */
+	constexpr int pad_error_invalid_handle = -2137915389; /* 0x80920003 */
+	constexpr int pad_error_invalid_arg    = -2137915391; /* 0x80920001 */
 
 	LOGF("\t handle     = %d\n"
 	     "\t data       = 0x%016" PRIx64 "\n"
 	     "\t class_data = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(data), reinterpret_cast<uint64_t>(class_data));
 
-	if (const auto error = Controller::PadCheckHandle(handle); error != OK) {
-		return error;
+	if (handle != 1) {
+		return pad_error_invalid_handle;
 	}
 	if (data == nullptr || class_data == nullptr) {
 		return pad_error_invalid_arg;
@@ -120,7 +141,15 @@ static int KYTY_SYSV_ABI PadSetTiltCorrectionState(int handle, bool enabled) {
 	     "\t enabled = %d\n",
 	     handle, enabled ? 1 : 0);
 
-	return Controller::PadCheckHandle(handle);
+	return 0;
+}
+
+static int KYTY_SYSV_ABI PadClose(int handle) {
+	PRINT_NAME();
+
+	LOGF("\t handle = %d\n", handle);
+
+	return OK;
 }
 
 // PPSA02385
@@ -144,7 +173,7 @@ static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* in
 	     "\t info   = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(info));
 
-	return Controller::PadCheckHandle(handle);
+	return OK;
 }
 
 static int KYTY_SYSV_ABI PadUnknownN3kSX62fgNo(uint64_t arg0, uint64_t arg1, uint64_t arg2,
@@ -184,10 +213,10 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("yFVnOdGxvZY", Controller::PadSetVibration);
 	LIB_FUNC("W2G-yoyMF5U", PadSetVibrationMode);
 	LIB_FUNC("Yq0zOH7YNOM", PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse);
-	LIB_FUNC("znaWI0gpuo8", Controller::PadGetTriggerEffectState);
+	LIB_FUNC("znaWI0gpuo8", PadGetTriggerEffectState);
 	LIB_FUNC("DscD1i9HX1w", Controller::PadResetLightBar);
 	LIB_FUNC("RR4novUEENY", Controller::PadSetLightBar);
-	LIB_FUNC("6ncge5+l5Qs", Controller::PadClose);
+	LIB_FUNC("6ncge5+l5Qs", PadClose);
 	LIB_FUNC("n3kSX62fgNo", PadUnknownN3kSX62fgNo);
 }
 

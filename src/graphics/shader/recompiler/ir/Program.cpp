@@ -1,6 +1,8 @@
 #include "common/assert.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <new>
@@ -81,8 +83,7 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 		    program.memory_info[li] != program.memory_info[ri]) {
 			return false;
 		}
-	} else if (lhs->GetOpcode() != ValueOpcode::ReadConst &&
-	           lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
+	} else if (lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
 		return false;
 	}
 	for (size_t index = 0; index < lhs->NumArgs(); index++) {
@@ -113,12 +114,31 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 }
 
 Program::~Program() {
+	// KYTY_IR_LINEAR_USES: every instruction of both goes now, so nobody's use list needs
+	// maintaining (removing each use one by one was quadratic for widely used values).
+	const bool drop = GetCodegenOptions().ir_linear_uses;
 	// Planning expressions can refer to block values but outlive block storage in the base class.
 	for (auto& inst: value_storage) {
-		inst.Invalidate();
+		if (drop) {
+			inst.DropForDestruction();
+		} else {
+			inst.Invalidate();
+		}
 	}
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
 	// its instruction storage so reverse-use links always point to live definitions.
+	if (drop) {
+		// Every owned block, listed or not: an instruction left attached would look for its entry
+		// in a dropped list when it is destroyed.
+		for (auto& block: block_storage) {
+			if (block != nullptr) {
+				for (auto& inst: *block) {
+					inst.DropForDestruction();
+				}
+			}
+		}
+		return;
+	}
 	for (auto* block: blocks) {
 		for (auto& inst: *block) {
 			inst.Invalidate();
@@ -145,6 +165,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .has_address_writes = has_address_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
+	    .write_ranges    = std::move(write_ranges),
 	};
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
@@ -190,18 +211,6 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	return invariant;
 }
 
-Value ResolveActiveU32(Value value, Value active) {
-	for (uint32_t depth = 0; depth <= 32; ++depth) {
-		value = value.Resolve();
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32 ||
-		    inst->Arg(0).Resolve() != active)
-			return value;
-		value = inst->Arg(1);
-	}
-	return {};
-}
-
 bool HasShaderMemoryWrites(const Program& program) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
@@ -216,6 +225,17 @@ bool HasShaderMemoryWrites(const Program& program) {
 		}
 	}
 	return false;
+}
+
+bool ValidationEnabled() {
+	static const bool enabled = [] {
+		if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
+			return true;
+		}
+		const auto* value = std::getenv("KYTY_IR_VALIDATE");
+		return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
+	}();
+	return enabled;
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {
@@ -469,8 +489,11 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
-				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
-					return Fail("indirect buffer requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
+				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode()) &&
+				    !memory.SupportsIndirectRawLoad(inst.GetOpcode()) &&
+				    !(program.info.bda_writes &&
+				      memory.SupportsIndirectRawWrite(inst.GetOpcode()))) {
+					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
 				}
 				if (buffer_components > 1u &&
 				    (!vector_buffer || memory.data_bits != 32u ||

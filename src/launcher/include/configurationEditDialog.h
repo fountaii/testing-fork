@@ -33,8 +33,6 @@ public:
 
 signals:
 	void PreviewControllerColor(const QString& color);
-	void ImportGameSettings();
-	void ExportGameSettings();
 
 private:
 	Ui::ConfigurationEditDialog* m_ui = nullptr;

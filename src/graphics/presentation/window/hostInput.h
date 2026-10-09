@@ -13,7 +13,7 @@ void               HostInputShutdown();
 void               HostInputKey(int key_code, bool down);
 void               HostInputMouseButton(uint8_t mouse_button, bool down);
 void               HostInputToggleMouseToJoystick();
-[[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
+[[nodiscard]] bool HostInputWaitEvent(SDL_Event* event);
 
 } // namespace Libs::Graphics
 

@@ -1,17 +1,59 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/CodegenOptions.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <mutex>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 namespace {
 
 using IR::ResourceKind;
+
+// Logs the first TFE/LWE fetch of each shader so PRT/LOD-warn users are visible in logs.
+void NoteFetchStatus(uint64_t shader_hash, const Decoder::Instruction& inst) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> logged;
+	{
+		std::scoped_lock lock(mutex);
+		if (!logged.insert(shader_hash).second) {
+			return;
+		}
+	}
+	LOGF("Shader 0x%016" PRIx64 ": %s uses%s%s; its status dword is written as 0 "
+	     "(resident, LOD not clamped)\n",
+	     shader_hash, Decoder::InstructionToString(inst).c_str(), inst.tfe ? " TFE" : "",
+	     inst.lwe ? " LWE" : "");
+}
+
+bool IsLdsWriteOpcode(Decoder::Opcode opcode) {
+	switch (opcode) {
+		case Decoder::Opcode::DS_WRITE_B8:
+		case Decoder::Opcode::DS_WRITE_B16:
+		case Decoder::Opcode::DS_WRITE_B8_D16_HI:
+		case Decoder::Opcode::DS_WRITE_B16_D16_HI:
+		case Decoder::Opcode::DS_WRITE_B32:
+		case Decoder::Opcode::DS_WRITE_B64:
+		case Decoder::Opcode::DS_WRITE_B96:
+		case Decoder::Opcode::DS_WRITE_B128:
+		case Decoder::Opcode::DS_WRITE2_B32:
+		case Decoder::Opcode::DS_WRITE2ST64_B32:
+		case Decoder::Opcode::DS_WRITE2_B64:
+		case Decoder::Opcode::DS_WRITE2ST64_B64:
+		case Decoder::Opcode::DS_WRITE_ADDTID_B32:
+		case Decoder::Opcode::DS_MIN_F32:
+		case Decoder::Opcode::DS_MAX_F32: return true;
+		default:
+			return opcode >= Decoder::Opcode::DS_ADD_U32 &&
+			       opcode <= Decoder::Opcode::DS_WRXCHG_RTN_B32;
+	}
+}
 
 const Decoder::Operand& DecodedSourceAt(const Decoder::Instruction& decoded, uint32_t index) {
 	switch (index) {
@@ -129,9 +171,8 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	// Vector loads use GLC/DLC to bypass L0/GL1; atomics use GLC only to return data.
 	const bool buffer_atomic = decoded.opcode >= Decoder::Opcode::BUFFER_ATOMIC_SWAP &&
 	                           decoded.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX;
-	memory.coherent = (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::Flat ||
-	                   memory.kind == ResourceKind::Global) &&
-	                  !buffer_atomic && (decoded.glc || decoded.dlc);
+	memory.coherent = memory.kind == ResourceKind::Buffer && !buffer_atomic &&
+	                  (decoded.glc || decoded.dlc);
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {
@@ -187,7 +228,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 	if (decoded.family == Decoder::Family::MUBUF || decoded.family == Decoder::Family::MTBUF) {
 		const bool store_or_atomic =
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_X &&
-		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X) ||
+		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW) ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_BYTE &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_DWORDX4) ||
 		    (decoded.opcode >= Decoder::Opcode::TBUFFER_STORE_FORMAT_X &&
@@ -236,7 +277,6 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src0 : MakeImmediate(decoded.offset & 0xffffu);
 			case Decoder::Opcode::DS_CONSUME:
 			case Decoder::Opcode::DS_APPEND:
-				return decoded.gds ? MakeM0Operand() : MakeImmediate(0);
 			case Decoder::Opcode::DS_READ_ADDTID_B32: return MakeM0Operand();
 			case Decoder::Opcode::DS_WRITE_ADDTID_B32:
 				return index == 0u ? decoded.src1 : MakeM0Operand();
@@ -427,7 +467,7 @@ void Translator::S_LOAD(const Decoder::Instruction& inst, bool raw) {
 void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	const auto      memory = MemoryInfoFromDecoded(inst);
 	IR::ValueOpcode opcode;
-	const auto      bits = memory.formatted ? 32u : memory.data_bits;
+	const auto      bits = memory.data_bits;
 	const auto      sign = memory.data_signed;
 	switch (bits) {
 		case 8u: opcode = IR::ValueOpcode::LoadBufferU8; break;
@@ -463,6 +503,7 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 			             ir.CompositeExtract(loaded, component));
 		}
 	}
+	WriteFetchStatus(inst, memory);
 }
 
 void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
@@ -473,8 +514,7 @@ void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 	const auto      data     = ReadU32(data_src);
 	IR::ValueOpcode opcode;
 	IR::Value       value;
-	// Formatted stores carry packed VGPR bits; the format determines their conversion.
-	switch (memory.formatted ? 32u : memory.data_bits) {
+	switch (memory.data_bits) {
 		case 8u:
 			opcode = IR::ValueOpcode::StoreBufferU8;
 			value  = NarrowSubdword(data, 8u);
@@ -535,6 +575,14 @@ void Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode
 		                 {resource, address.index, address.offset, address.soffset, desired,
 		                  comparator, ir.GetExec()},
 		                 flags);
+	} else if (opcode == IR::ValueOpcode::BufferAtomicCmpSwap64) {
+		// DATA[0:1] is the new value and DATA[2:3] the comparator.
+		const auto desired    = ReadU64(data_src);
+		const auto comparator = ReadU64(OffsetOperand(data_src, 2u));
+		result = ir.Emit(opcode,
+		                 {resource, address.index, address.offset, address.soffset, desired,
+		                  comparator, ir.GetExec()},
+		                 flags);
 	} else {
 		const IR::Value value =
 		    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
@@ -556,18 +604,18 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 1));
 	const auto data     = MemorySourceAt(inst, 0);
-	const auto flags    = AddMemoryInfo(memory, inst.pc);
 	IR::Value  result;
-	if (opcode == IR::ValueOpcode::ImageAtomicCompareSwap32) {
-		// VDATA supplies the replacement; VDATA+1 supplies the comparison.
+	if (opcode == IR::ValueOpcode::ImageAtomicCmpSwap32) {
+		// DATA[0] is the new value and DATA[1] the comparator; only DATA[0] is returned.
 		result = ir.Emit(opcode,
 		                 {resource, address, ReadU32(data), ReadU32(OffsetOperand(data, 1u)),
 		                  ir.GetExec()},
-		                 flags);
+		                 AddMemoryInfo(memory, inst.pc));
 	} else {
 		const IR::Value value =
 		    memory.data_bits == 64u ? IR::Value(ReadU64(data)) : IR::Value(ReadU32(data));
-		result = ir.Emit(opcode, {resource, address, value, ir.GetExec()}, flags);
+		result = ir.Emit(opcode, {resource, address, value, ir.GetExec()},
+		                 AddMemoryInfo(memory, inst.pc));
 	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
@@ -645,6 +693,22 @@ void Translator::FLAT_STORE(const Decoder::Instruction& inst) {
 	}
 }
 
+void Translator::WriteFetchStatus(const Decoder::Instruction& inst,
+                                  const IR::MemoryInfo&       memory) {
+	if (!inst.tfe && !inst.lwe) {
+		return;
+	}
+	// TFE/LWE fetches return one status dword after the data. Host memory is always
+	// resident and LOD warnings are not modelled (the LOD_CLAMPED bit position is not
+	// documented), so report success instead of leaving a stale VGPR for the shader to test.
+	NoteFetchStatus(program.shader_hash, inst);
+	const auto status = OffsetOperand(inst.dst, std::max(memory.data_dwords, 1u));
+	if (status.kind != Decoder::OperandKind::Vgpr || status.reg >= IR::NumVectorRegs) {
+		return;
+	}
+	WriteOperand(status, IR::U32(IR::Value(0u)));
+}
+
 void Translator::IMAGE_GET_RESINFO(const Decoder::Instruction& inst) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
@@ -671,6 +735,7 @@ void Translator::IMAGE_LOAD(const Decoder::Instruction& inst) {
 	const auto result   = ir.Emit(IR::ValueOpcode::ImageRead, {resource, address, ir.GetExec()},
 	                              AddMemoryInfo(memory, inst.pc));
 	WriteImageComponents(inst.dst, result, memory, 4u);
+	WriteFetchStatus(inst, memory);
 }
 
 void Translator::IMAGE_STORE(const Decoder::Instruction& inst) {
@@ -699,6 +764,7 @@ void Translator::IMAGE_SAMPLE(const Decoder::Instruction& inst) {
 	} else {
 		WriteImageComponents(inst.dst, result, memory, 4u);
 	}
+	WriteFetchStatus(inst, memory);
 }
 
 void Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
@@ -720,6 +786,7 @@ void Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 		WriteOperand(OffsetOperand(inst.dst, index),
 		             ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(index)}));
 	}
+	WriteFetchStatus(inst, memory);
 }
 
 IR::Value Translator::LoadSharedU32(uint32_t width, IR::U32 address, const IR::MemoryInfo& memory,
@@ -858,7 +925,8 @@ void Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 void Translator::DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	WriteOperand(inst.dst, ir.Emit(opcode,
-	                               {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
+	                               {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec(), ir.GetExecLo(),
+	                                ir.GetExecHi()},
 	                               AddMemoryInfo(memory, inst.pc)));
 }
 
@@ -884,50 +952,6 @@ void Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 	                                ReadU32(MemorySourceAt(inst, 1)), ir.GetExec()}));
 }
 
-void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
-	// Approximate ordered counting with one GDS atomic per wave. Wave-launch ordering and
-	// release/done synchronization are not emulated.
-	const auto memory = MemoryInfoFromDecoded(inst);
-	const auto m0 = ir.GetM0();
-	auto address = ir.BitwiseAnd(ir.ShiftRightLogical(m0, IR::U32(IR::Value(16u))),
-	                             IR::U32(IR::Value(0xfffcu)));
-	if (((inst.secondary_offset >> 2u) & 3u) == 1u) {
-		const auto packer = ir.BitwiseAnd(m0, IR::U32(IR::Value(0xfu)));
-		address = ir.IAdd(address, ir.ShiftLeftLogical(packer, IR::U32(IR::Value(2u))));
-	}
-	const auto exec   = ir.GetExec();
-	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {exec});
-	const auto low = ir.CompositeExtract(ballot, 0u);
-	const auto high = ir.CompositeExtract(ballot, 1u);
-	const auto active = ir.INotEqual(ir.BitwiseOr(low, high), IR::U32(IR::Value(0u)));
-	const auto first = ir.Select(
-	    ir.INotEqual(low, IR::U32(IR::Value(0u))),
-	    IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {low})),
-	    ir.IAdd(IR::U32(IR::Value(32u)), IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {high}))));
-	// An empty EXEC still returns the counter. Elect lane zero and perform an add of zero.
-	const auto selected = ir.Select(active, first, IR::U32(IR::Value(0u)));
-	const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
-	const auto is_first = ir.IEqual(lane, selected);
-	const auto source = IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane,
-	                                   {ReadU32(inst.src0), is_first}));
-	const auto value = ir.Select(active, source, IR::U32(IR::Value(0u)));
-	const auto flags = AddMemoryInfo(memory, inst.pc);
-	IR::U32 result;
-	if (((inst.secondary_offset >> 4u) & 3u) == 1u) {
-		const auto swapped = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicSwap32,
-		    {address, value, ir.LogicalAnd(is_first, active)}, flags));
-		const auto unchanged = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
-		    {address, IR::Value(0u), ir.LogicalAnd(is_first, ir.LogicalNot(active))}, flags));
-		result = ir.Select(active, swapped, unchanged);
-	} else {
-		result = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
-		                        {address, value, is_first}, flags));
-	}
-	// DS_ORDERED_COUNT writes every destination lane, regardless of EXEC.
-	ir.SetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg),
-	    IR::U32(ir.Emit(IR::ValueOpcode::ReadFirstLane, {result, is_first})));
-}
-
 void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 	const auto address = ir.IAdd(ReadU32(inst.src0), IR::U32(IR::Value(inst.offset)));
 	WriteOperand(inst.dst, ir.Emit(backward ? IR::ValueOpcode::BpermuteU32
@@ -936,17 +960,18 @@ void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 }
 
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
+	if (inst.family == Decoder::Family::DS && !inst.gds && IsLdsWriteOpcode(inst.opcode)) {
+		lds_write_pending = true;
+	}
 	switch (inst.opcode) {
-		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
-			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
-			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
-			    inst.image_address_components - 10u);
-			for (uint32_t component = 0; component < 4; ++component) {
-				WriteOperand(OffsetOperand(inst.dst, component),
-				    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));
-			}
+		case Decoder::Opcode::S_DCACHE_INV:
+		case Decoder::Opcode::S_GL1_INV:
+		case Decoder::Opcode::BUFFER_GL0_INV:
+		case Decoder::Opcode::BUFFER_GL1_INV:
+			// Host shader memory has no guest-visible L0/GL1 cache to invalidate.
+			EmitControlNop();
 			return;
-		}
+
 		case Decoder::Opcode::S_LOAD_DWORD:
 		case Decoder::Opcode::S_LOAD_DWORDX2:
 		case Decoder::Opcode::S_LOAD_DWORDX4:
@@ -958,6 +983,21 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return S_LOAD(inst, false);
 		case Decoder::Opcode::S_MEMREALTIME: {
+			if (GetCodegenOptions().realtime_clock) {
+				static std::atomic_flag noted = ATOMIC_FLAG_INIT;
+				if (!noted.test_and_set(std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Shader: S_MEMREALTIME reads the host GPU clock (first in 0x{:016x}; "
+					    "KYTY_REALTIME_CLOCK=0 restores the placeholder)\n",
+					    program.shader_hash));
+				}
+				const auto words =
+				    ExtractU64(IR::U64(ir.Emit(IR::ValueOpcode::ReadClockRealtime64)));
+				for (uint32_t component = 0; component < 2; component++) {
+					WriteOperand(ScalarDestinationOperand(inst.dst, component), words[component]);
+				}
+				return;
+			}
 			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 			if (!warned.test_and_set(std::memory_order_relaxed)) {
 				Log::WriteToConsoleAndLog(
@@ -981,7 +1021,6 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
-		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZ:
@@ -997,7 +1036,6 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
-		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
@@ -1031,6 +1069,26 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicOr64);
 		case Decoder::Opcode::BUFFER_ATOMIC_XOR:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicXor32);
+		case Decoder::Opcode::BUFFER_ATOMIC_INC:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicInc32);
+		case Decoder::Opcode::BUFFER_ATOMIC_DEC:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicDec32);
+		case Decoder::Opcode::BUFFER_ATOMIC_CMPSWAP_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicCmpSwap64);
+		case Decoder::Opcode::BUFFER_ATOMIC_ADD_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd64);
+		case Decoder::Opcode::BUFFER_ATOMIC_SUB_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicISub64);
+		case Decoder::Opcode::BUFFER_ATOMIC_SMIN_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMin64);
+		case Decoder::Opcode::BUFFER_ATOMIC_UMIN_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMin64);
+		case Decoder::Opcode::BUFFER_ATOMIC_SMAX_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSMax64);
+		case Decoder::Opcode::BUFFER_ATOMIC_UMAX_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicUMax64);
+		case Decoder::Opcode::BUFFER_ATOMIC_XOR_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicXor64);
 		case Decoder::Opcode::BUFFER_ATOMIC_FMIN:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicFMin32);
 		case Decoder::Opcode::BUFFER_ATOMIC_FMAX:
@@ -1089,8 +1147,6 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
 
-		case Decoder::Opcode::IMAGE_ATOMIC_CMPSWAP:
-			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicCompareSwap32);
 		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32,
 			                    IR::ValueOpcode::ImageAtomicSwap64);
@@ -1116,6 +1172,14 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_ATOMIC_XOR:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicXor32,
 			                    IR::ValueOpcode::ImageAtomicXor64);
+		case Decoder::Opcode::IMAGE_ATOMIC_CMPSWAP:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicCmpSwap32);
+		case Decoder::Opcode::IMAGE_ATOMIC_SUB:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicISub32);
+		case Decoder::Opcode::IMAGE_ATOMIC_INC:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicInc32);
+		case Decoder::Opcode::IMAGE_ATOMIC_DEC:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicDec32);
 		case Decoder::Opcode::IMAGE_ATOMIC_FMIN:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMin32);
 		case Decoder::Opcode::IMAGE_ATOMIC_FMAX:
@@ -1153,6 +1217,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicFMin32, false);
@@ -1161,7 +1227,6 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_SWIZZLE_B32: return DS_SWIZZLE_B32(inst);
 		case Decoder::Opcode::DS_PERMUTE_B32: return DS_PERMUTE(inst, false);
 		case Decoder::Opcode::DS_BPERMUTE_B32: return DS_PERMUTE(inst, true);
-		case Decoder::Opcode::DS_ORDERED_COUNT: return DS_ORDERED_COUNT(inst);
 		case Decoder::Opcode::DS_CONSUME:
 			return DS_APPEND_CONSUME(inst, IR::ValueOpcode::DataConsume);
 		case Decoder::Opcode::DS_APPEND:

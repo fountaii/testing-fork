@@ -93,8 +93,8 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:
-		case ValueOpcode::StoreCompletion:
-		case ValueOpcode::Barrier: return true;
+		case ValueOpcode::Barrier:
+		case ValueOpcode::SharedMemoryBarrier: return true;
 		default: return false;
 	}
 }
@@ -128,6 +128,16 @@ BufferAccess BufferAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicOr32:
 		case ValueOpcode::BufferAtomicOr64:
 		case ValueOpcode::BufferAtomicXor32:
+		case ValueOpcode::BufferAtomicInc32:
+		case ValueOpcode::BufferAtomicDec32:
+		case ValueOpcode::BufferAtomicCmpSwap64:
+		case ValueOpcode::BufferAtomicIAdd64:
+		case ValueOpcode::BufferAtomicISub64:
+		case ValueOpcode::BufferAtomicSMin64:
+		case ValueOpcode::BufferAtomicUMin64:
+		case ValueOpcode::BufferAtomicSMax64:
+		case ValueOpcode::BufferAtomicUMax64:
+		case ValueOpcode::BufferAtomicXor64:
 		case ValueOpcode::BufferAtomicFMin32:
 		case ValueOpcode::BufferAtomicFMax32: return BufferAccess::Atomic;
 		default: return BufferAccess::None;
@@ -139,6 +149,14 @@ uint32_t BufferComponentCount(ValueOpcode opcode) {
 		case ValueOpcode::BufferAtomicSwap64:
 		case ValueOpcode::BufferAtomicAnd64:
 		case ValueOpcode::BufferAtomicOr64:
+		case ValueOpcode::BufferAtomicCmpSwap64:
+		case ValueOpcode::BufferAtomicIAdd64:
+		case ValueOpcode::BufferAtomicISub64:
+		case ValueOpcode::BufferAtomicSMin64:
+		case ValueOpcode::BufferAtomicUMin64:
+		case ValueOpcode::BufferAtomicSMax64:
+		case ValueOpcode::BufferAtomicUMax64:
+		case ValueOpcode::BufferAtomicXor64:
 		case ValueOpcode::LoadBufferU32x2:
 		case ValueOpcode::StoreBufferU32x2: return 2u;
 		case ValueOpcode::LoadBufferU32x3:
@@ -205,6 +223,7 @@ AddressOpcodeInfo AddressOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::LoadAddressU8: return {AddressAccess::Read, 8u};
 		case ValueOpcode::LoadAddressU16: return {AddressAccess::Read, 16u};
 		case ValueOpcode::LoadAddressU32: return {AddressAccess::Read, 32u};
+		case ValueOpcode::BvhIntersectRay: return {AddressAccess::Read, 32u};
 		case ValueOpcode::StoreAddressU8: return {AddressAccess::Write, 8u};
 		case ValueOpcode::StoreAddressU16: return {AddressAccess::Write, 16u};
 		case ValueOpcode::StoreAddressU32: return {AddressAccess::Write, 32u};
@@ -222,7 +241,6 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 			return {ImageAccess::Read, ImageResourceClass::Sampled, true};
 		case ValueOpcode::ImageWrite:
 			return {ImageAccess::Write, ImageResourceClass::Storage, false};
-		case ValueOpcode::ImageAtomicCompareSwap32:
 		case ValueOpcode::ImageAtomicSwap32:
 		case ValueOpcode::ImageAtomicSwap64:
 		case ValueOpcode::ImageAtomicIAdd32:
@@ -238,6 +256,10 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 		case ValueOpcode::ImageAtomicOr32:
 		case ValueOpcode::ImageAtomicOr64:
 		case ValueOpcode::ImageAtomicXor32:
+		case ValueOpcode::ImageAtomicCmpSwap32:
+		case ValueOpcode::ImageAtomicISub32:
+		case ValueOpcode::ImageAtomicInc32:
+		case ValueOpcode::ImageAtomicDec32:
 		case ValueOpcode::ImageAtomicXor64:
 		case ValueOpcode::ImageAtomicFMin32:
 		case ValueOpcode::ImageAtomicFMax32:

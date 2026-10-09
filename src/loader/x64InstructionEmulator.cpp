@@ -3,7 +3,10 @@
 #include "common/common.h"
 
 #include <Zydis/Zydis.h>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -12,7 +15,6 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 #elif defined(__APPLE__)
-#include <sched.h>
 #include <sys/ucontext.h>
 #else
 #include <sched.h>
@@ -469,16 +471,6 @@ struct Context {
 			default: return nullptr;
 		}
 	}
-	// The kernel hands AVX threads the longer context that carries YMM[255:128]; a plain SSE
-	// context has no such state to clear.
-	void ClearUpperYmm(uint8_t index) const {
-		if (index >= 16 || native->uc_mcsize < sizeof(_STRUCT_MCONTEXT_AVX64)) {
-			return;
-		}
-		auto* avx = reinterpret_cast<_STRUCT_MCONTEXT_AVX64*>(native->uc_mcontext);
-		auto* ymmh = &avx->__fs.__fpu_ymmh0;
-		ymmh[index] = {};
-	}
 #else
 	ucontext_t* native;
 
@@ -714,6 +706,8 @@ static bool TryEmulateCpuExtensions(Context& context) {
 	return true;
 }
 
+#if !defined(__APPLE__)
+
 static bool TryEmulateMonitorxMwaitx(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	if (rip[0] != 0x0f || rip[1] != 0x01 || (rip[2] != 0xfa && rip[2] != 0xfb)) {
@@ -756,7 +750,29 @@ static uint32_t ReciprocalSquareRoot(uint32_t bits) {
 	return std::bit_cast<uint32_t>(_mm_cvtss_f32(_mm_cvtsd_ss(_mm_setzero_ps(), result)));
 }
 
+// GetReciprocalSqrtStats. Astro Bot traps here ~2.5 million times a second from a dozen guest
+// threads, so each thread counts in its own cache line (one relaxed add); the emulation time is
+// measured only with KYTY_AMD_CPU_TIMING=1 (read once when the patch is applied).
+struct alignas(64) TrapSlot {
+	std::atomic<uint64_t> traps {0};
+	std::atomic<uint64_t> ns {0};
+};
+static constexpr uint32_t    TrapSlotCount = 32;
+static TrapSlot              g_rsqrt_slots[TrapSlotCount];
+static std::atomic<uint32_t> g_rsqrt_next_slot {0};
+static std::atomic<bool>     g_rsqrt_timing {false};
+static thread_local uint32_t t_rsqrt_slot = 0; // 1 + slot index; 0: none yet
+
+static TrapSlot& ThisThreadTrapSlot() {
+	if (t_rsqrt_slot == 0) {
+		t_rsqrt_slot = 1 + g_rsqrt_next_slot.fetch_add(1, std::memory_order_relaxed) % TrapSlotCount;
+	}
+	return g_rsqrt_slots[t_rsqrt_slot - 1];
+}
+
 static bool TryEmulateReciprocalSquareRoot(Context& context) {
+	const bool  timing         = g_rsqrt_timing.load(std::memory_order_relaxed);
+	const auto  start          = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	const auto* rip            = reinterpret_cast<const uint8_t*>(context.Rip());
 	size_t      prefix_size    = 0;
 	uint8_t     dest_extension = 0;
@@ -796,7 +812,36 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	std::memcpy(dest_xmm, &result, sizeof(result));
 	context.ClearUpperYmm(dest);
 	context.Advance(prefix_size + 2);
+	auto& slot = ThisThreadTrapSlot();
+	slot.traps.fetch_add(1, std::memory_order_relaxed);
+	if (timing) {
+		slot.ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                            std::chrono::steady_clock::now() - start)
+		                                            .count()),
+		                  std::memory_order_relaxed);
+	}
 	return true;
+}
+
+#endif
+
+void ConfigureReciprocalSqrtStats() {
+#if !defined(__APPLE__)
+	if (const char* timing = std::getenv("KYTY_AMD_CPU_TIMING"); timing != nullptr) {
+		g_rsqrt_timing.store(std::strcmp(timing, "1") == 0, std::memory_order_relaxed);
+	}
+#endif
+}
+
+ReciprocalSqrtStats GetReciprocalSqrtStats() {
+	ReciprocalSqrtStats stats;
+#if !defined(__APPLE__)
+	for (const auto& slot: g_rsqrt_slots) {
+		stats.traps += slot.traps.load(std::memory_order_relaxed);
+		stats.emulate_ns += slot.ns.load(std::memory_order_relaxed);
+	}
+#endif
+	return stats;
 }
 
 bool TryEmulate(void* native_context) {
@@ -814,12 +859,12 @@ bool TryEmulate(void* native_context) {
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
-	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
-	       TryEmulateSse4a(context) ||
 #if !defined(__APPLE__)
-	       TryEmulateShaNi(context) ||
+	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
+	       TryEmulateSse4a(context) || TryEmulateShaNi(context) || TryEmulateCpuExtensions(context);
+#else
+	return TryEmulateSse4a(context) || TryEmulateCpuExtensions(context);
 #endif
-	       TryEmulateCpuExtensions(context);
 }
 
 } // namespace Loader::X64InstructionEmulator

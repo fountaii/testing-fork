@@ -6,11 +6,11 @@
 #include "common/file.h"
 #include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
+#include "common/platform/sysFileIO.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
-#include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
@@ -18,7 +18,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 
 #include <chrono>
 #include <csignal>
@@ -34,9 +33,11 @@
 #include <thread>
 #include <vector>
 
-#if defined(__linux__)
-#include <sys/mman.h>
-#include <unistd.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 namespace Libs::LibKernelApr {
@@ -45,13 +46,6 @@ void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 
 namespace Libs {
 void InitLibKernel_1(Loader::SymbolDatabase *symbols);
-void InitSysmodule_1(Loader::SymbolDatabase *symbols);
-void InitSystemService_1(Loader::SymbolDatabase *symbols);
-void InitAppContent_1(Loader::SymbolDatabase *symbols);
-}
-
-namespace Libs::LibAmpr {
-void InitAmpr_1(Loader::SymbolDatabase *symbols);
 }
 
 namespace Libs::LibNet {
@@ -60,10 +54,6 @@ void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 
 namespace Libs::LibNpWebApi2 {
 void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
-}
-
-namespace Libs::LibNpCommerce {
-void InitNet_1_NpCommerce(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -101,6 +91,95 @@ private:
   std::filesystem::path m_path;
 };
 
+#ifdef _WIN32
+// Stands in for the emulator's write tracking: unprotect a faulting page and retry.
+LONG CALLBACK UnprotectOnWriteFault(PEXCEPTION_POINTERS info) {
+  if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+      info->ExceptionRecord->ExceptionInformation[0] == 1) {
+    void *address = reinterpret_cast<void *>(info->ExceptionRecord->ExceptionInformation[1]);
+    DWORD old     = 0;
+    if (VirtualProtect(address, 1, PAGE_READWRITE, &old) != 0) {
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void CheckReadIntoProtectedMemory(const std::filesystem::path &root) {
+  // Larger than one bounce chunk (1 MiB) so the chunked path is exercised.
+  constexpr uint32_t file_size = (2u << 20u) + 12345u;
+  std::vector<uint8_t> content(file_size);
+  for (size_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<uint8_t>((i * 131u + (i >> 8u)) & 0xFFu);
+  }
+  const auto path = root / "protected_read.bin";
+  {
+    std::FILE *out = _wfopen(path.c_str(), L"wb");
+    Check(out != nullptr, "create protected read file");
+    Check(std::fwrite(content.data(), 1, content.size(), out) == content.size(),
+          "write protected read file");
+    std::fclose(out);
+  }
+
+  const size_t region_size = 4u << 20u;
+  auto *region = static_cast<uint8_t *>(
+      VirtualAlloc(nullptr, region_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(region != nullptr, "allocate protected read region");
+  void *handler = AddVectoredExceptionHandler(1, UnprotectOnWriteFault);
+  Check(handler != nullptr, "install write fault handler");
+
+  auto protect = [&] {
+    DWORD old = 0;
+    Check(VirtualProtect(region, region_size, PAGE_READONLY, &old) != 0, "protect region");
+  };
+
+  const auto before = SysFileReadFallbackCount();
+  auto *file = SysFileOpenR(path);
+  Check(file != nullptr && !SysFileIsError(*file), "open protected read file");
+
+  // Whole file, destination at an unaligned offset inside a read-only region.
+  protect();
+  uint32_t got = 0;
+  SysFileRead(region + 77, file_size, *file, &got);
+  Check(got == file_size, "protected read returns the full size");
+  Check(std::memcmp(region + 77, content.data(), file_size) == 0, "protected read content");
+  Check(SysFileReadFallbackCount() > before, "protected read used the host buffer");
+
+  // Short read at EOF and a read at EOF.
+  Check(SysFileSeek(*file, file_size - 100), "seek near EOF");
+  protect();
+  got = 1234;
+  SysFileRead(region + 4096, 5000, *file, &got);
+  Check(got == 100, "protected read stops at EOF");
+  Check(std::memcmp(region + 4096, content.data() + file_size - 100, 100) == 0,
+        "protected short read content");
+  protect();
+  got = 1234;
+  SysFileRead(region + 4096, 5000, *file, &got);
+  Check(got == 0, "protected read at EOF returns zero");
+
+  // Offsets: the file position continues after the fallback.
+  Check(SysFileSeek(*file, 1000), "seek to offset");
+  protect();
+  SysFileRead(region, 3000, *file, &got);
+  SysFileRead(region + 3000, 3000, *file, &got);
+  Check(got == 3000 && std::memcmp(region, content.data() + 1000, 6000) == 0,
+        "consecutive protected reads keep the file offset");
+
+  // Plain memory still takes the direct path.
+  const auto count = SysFileReadFallbackCount();
+  DWORD      old   = 0;
+  Check(VirtualProtect(region, region_size, PAGE_READWRITE, &old) != 0, "unprotect region");
+  Check(SysFileSeek(*file, 0), "seek to start");
+  SysFileRead(region, 4096, *file, &got);
+  Check(got == 4096 && SysFileReadFallbackCount() == count, "writable read stays on fast path");
+
+  SysFileClose(file);
+  RemoveVectoredExceptionHandler(handler);
+  VirtualFree(region, 0, MEM_RELEASE);
+}
+#endif
+
 void CheckSaveRename(const std::filesystem::path &root,
                      std::string_view payload) {
   constexpr char Source[] = "/savedata0/STEMP000.DAT";
@@ -126,138 +205,6 @@ void CheckSaveRename(const std::filesystem::path &root,
   Check(data.size() == expected.size(), "renamed save size");
   Check(std::memcmp(data.data(), expected.data(), expected.size()) == 0,
         "renamed save contents");
-}
-
-void TestRandomDevices() {
-  for (const auto* path : {"/dev/urandom", "/dev/random"}) {
-    const int fd = FileSystem::KernelOpen(path, 0, 0);
-    FileSystem::FileStat stat {};
-    Check(fd >= 3 && FileSystem::KernelFstat(fd, &stat) == OK &&
-              (stat.st_mode & 0170000) == 0020000,
-          "entropy sources are character devices");
-    std::array<uint8_t, 32> entropy {};
-    Check(FileSystem::KernelRead(fd, entropy.data(), entropy.size()) == entropy.size(),
-          "character device supplies requested entropy");
-    Check(FileSystem::KernelClose(fd) == OK, "close entropy source");
-  }
-}
-
-void TestFileDescriptorFlags() {
-  Loader::SymbolDatabase symbols;
-  Libs::InitLibKernel_1(&symbols);
-  const auto* symbol = symbols.Find(
-      {"8nY19bKoiZk", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
-  Check(symbol != nullptr, "POSIX fcntl export resolves");
-  const auto fcntl = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int, int)>(symbol->vaddr);
-  Check(fcntl(std::numeric_limits<int>::min(), 1, 0) == -1 &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
-        "invalid descriptor reports EBADF");
-  for (const auto* path : {"/dev/urandom", "/dev/random"}) {
-    const int fd = FileSystem::KernelOpen(path, 0, 0);
-    Check(fd >= 3, "open descriptor for flag checks");
-    Check(fcntl(fd, 1, 0) == 0 && fcntl(fd, 2, 1) == 0 && fcntl(fd, 1, 0) == 1,
-          "entropy descriptor retains close-on-exec flag");
-    Check(fcntl(fd, 2, 0) == 0 && fcntl(fd, 1, 0) == 0,
-          "close-on-exec flag can be cleared");
-    Check(fcntl(fd, -1, 0) == -1 && *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
-          "unsupported fcntl command reports EINVAL");
-    Check(FileSystem::KernelClose(fd) == OK, "close entropy source");
-    Check(fcntl(fd, 1, 0) == -1 && *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
-          "closed descriptor reports EBADF");
-    const int cloexec_fd = FileSystem::KernelOpen(path, 0x00100000, 0);
-    Check(cloexec_fd >= 3 && fcntl(cloexec_fd, 1, 0) == 1,
-          "O_CLOEXEC sets the descriptor flag on open");
-    Check(FileSystem::KernelClose(cloexec_fd) == OK, "close flagged entropy source");
-  }
-}
-
-void TestSysmoduleReferences() {
-  Loader::SymbolDatabase symbols;
-  Libs::InitSysmodule_1(&symbols);
-  using ModuleCall = int (KYTY_SYSV_ABI *)(uint16_t);
-  const auto resolve = [&](const char* nid) {
-    const auto* symbol = symbols.Find(
-        {nid, "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
-    Check(symbol != nullptr, "Sysmodule export resolves");
-    return reinterpret_cast<ModuleCall>(symbol->vaddr);
-  };
-  const auto load = resolve("g8cM39EUZ6o");
-  const auto unload = resolve("eR2bZFAAU0Q");
-  const auto is_loaded = resolve("fMP5NHUOaMk");
-  constexpr int unloaded = static_cast<int>(0x805a1001u);
-  Check(load(0x113) == OK && is_loaded(0xb4) == unloaded,
-        "loading entitlement access does not mark AppContent loaded");
-  Check(unload(0x113) == OK, "release independent module reference");
-  for (const uint16_t id : {0x113, 0xb4}) {
-    Check(is_loaded(id) == unloaded, "unloaded module allows guest initialization");
-    Check(unload(id) == unloaded, "unloading an absent module reports UNLOADED");
-    Check(load(id) == OK && load(id) == OK && is_loaded(id) == OK,
-          "repeated loads retain references");
-    Check(unload(id) == OK && is_loaded(id) == OK,
-          "one unload preserves the remaining reference");
-    Check(unload(id) == OK && is_loaded(id) == unloaded,
-          "last unload restores unloaded status");
-  }
-  const auto* internal_symbol = symbols.Find(
-      {"hHrGoGoNf+s", "Sysmodule", 1, "Sysmodule", 1, 1, Loader::SymbolType::Func});
-  Check(internal_symbol != nullptr, "internal Sysmodule load export resolves");
-  const auto internal_load =
-      reinterpret_cast<int (KYTY_SYSV_ABI *)(uint16_t, int, int, int, int*)>(
-          internal_symbol->vaddr);
-  int result = -1;
-  Check(internal_load(0xb4, 0, 0, 0, &result) == OK && result == OK &&
-            is_loaded(0xb4) == OK && unload(0xb4) == OK && is_loaded(0xb4) == unloaded,
-        "internal and public module operations share load state");
-}
-
-void TestSystemServiceEntitlementEvents() {
-  Loader::SymbolDatabase symbols;
-  Libs::InitSystemService_1(&symbols);
-  Libs::InitAppContent_1(&symbols);
-  const auto resolve = [&](const char* nid, const char* library, const char* module) {
-    const auto* symbol = symbols.Find(
-        {nid, library, 1, module, 1, 1, Loader::SymbolType::Func});
-    Check(symbol != nullptr, "entitlement event export resolves");
-    return symbol->vaddr;
-  };
-  const auto initialize = reinterpret_cast<int (KYTY_SYSV_ABI *)(const void*, void*)>(
-      resolve("R9lA82OraNs", "AppContent", "AppContentUtil"));
-  struct Status {
-    int32_t event_num;
-    bool overlay, background, vr;
-    uint8_t reserved[127];
-  };
-  struct Event {
-    int32_t type;
-    uint8_t data[8192];
-  };
-  static_assert(sizeof(Status) == 136 && sizeof(Event) == 8196);
-  const auto get_status = reinterpret_cast<int (KYTY_SYSV_ABI *)(Status*)>(
-      resolve("rPo6tV8D9bM", "SystemService", "SystemService"));
-  const auto receive = reinterpret_cast<int (KYTY_SYSV_ABI *)(Event*)>(
-      resolve("656LMQSrg6U", "SystemService", "SystemService"));
-  Status status {};
-  Event event {};
-  Check(get_status(&status) == OK && status.event_num == 0,
-        "SystemService starts without pending events");
-  std::array<uint8_t, 32> init {};
-  std::array<uint8_t, 40> boot {};
-  Check(initialize(init.data(), boot.data()) == OK,
-        "AppContent initialization generates an entitlement notification");
-  Check(get_status(&status) == OK && status.event_num == 1 &&
-            get_status(&status) == OK && status.event_num == 1,
-        "status queries preserve pending notifications");
-  Check(receive(nullptr) == Libs::SystemService::SYSTEM_SERVICE_ERROR_PARAMETER &&
-            get_status(&status) == OK && status.event_num == 1,
-        "invalid event output does not consume a notification");
-  std::memset(&event, 0xff, sizeof(event));
-  Check(receive(&event) == OK && event.type == 0x10000003 &&
-            std::all_of(std::begin(event.data), std::end(event.data),
-                        [](uint8_t byte) { return byte == 0; }) &&
-            get_status(&status) == OK && status.event_num == 0,
-        "receive delivers the entitlement event with cleared payload exactly once");
-  Check(receive(&event) == Libs::SystemService::SYSTEM_SERVICE_ERROR_NO_EVENT,
-        "empty event queue reports NO_EVENT");
 }
 
 void TestSaveOpenVisibility() {
@@ -308,14 +255,12 @@ void TestAioBatches() {
   using Batch = int (KYTY_SYSV_ABI *)(int32_t *, int32_t, int32_t *);
   using Single = int (KYTY_SYSV_ABI *)(int32_t, int32_t *);
   using Wait = int (KYTY_SYSV_ABI *)(int32_t, int32_t *, uint32_t *);
-  using WaitBatch = int (KYTY_SYSV_ABI *)(int32_t *, int32_t, int32_t *, uint32_t, uint32_t *);
   const auto submit = reinterpret_cast<Submit>(find("HgX7+AORI58"));
   const auto poll = reinterpret_cast<Batch>(find("o7O4z3jwKzo"));
   const auto erase = reinterpret_cast<Batch>(find("Ft3EtsZzAoY"));
   const auto poll_one = reinterpret_cast<Single>(find("2pOuoWoCxdk"));
   const auto erase_one = reinterpret_cast<Single>(find("5TgME6AYty4"));
   const auto wait = reinterpret_cast<Wait>(find("KOF-oJbQVvc"));
-  const auto wait_batch = reinterpret_cast<WaitBatch>(find("lgK+oIWkJyA"));
   constexpr char Payload[] = "AIO payload";
   const int fd = FileSystem::KernelOpen("/savedata0/aio.dat", 0x602, 0777);
   Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload)) == sizeof(Payload),
@@ -332,22 +277,14 @@ void TestAioBatches() {
   }
   ids[2] = -1;
   std::array<int32_t, 3> states {-1, -1, -1};
-  uint32_t timeout = 0;
-  Check(wait_batch(ids.data(), ids.size(), states.data(), 2, &timeout) == OK &&
+  Check(poll(ids.data(), ids.size(), states.data()) == OK &&
             states[0] == 3 && states[1] == 3 && states[2] == Kernel::KERNEL_ERROR_ESRCH,
-        "OR wait observes completed reads and invalid-ID errors even with a zero timeout");
+        "batch poll writes every state and per-request invalid-ID error");
   Check(poll_one(ids[0], &states[0]) == OK && states[0] == (3 | 0x10000) &&
             poll(ids.data(), 2, states.data()) == OK &&
             states[0] == (3 | 0x10000) && states[1] == (3 | 0x10000) &&
             wait(ids[0], &states[0], nullptr) == OK && states[0] == (3 | 0x10000),
         "single and batch polls and waits share completion notification state");
-  timeout = 1000000;
-  Check(wait_batch(ids.data(), ids.size(), states.data(), 1, &timeout) == OK &&
-            states[0] == (3 | 0x10000) && states[1] == (3 | 0x10000) &&
-            states[2] == Kernel::KERNEL_ERROR_ESRCH && timeout <= 1000000 &&
-            wait_batch(ids.data(), ids.size(), states.data(), 2, nullptr) == OK &&
-            wait_batch(ids.data(), 1, states.data(), 0, nullptr) == OK,
-        "AND and OR waits return when all IDs are terminal and one-ID waits ignore mode");
   Check(erase(ids.data(), ids.size(), states.data()) == OK &&
             states[0] == OK && states[1] == OK && states[2] == Kernel::KERNEL_ERROR_ESRCH,
         "batch deletion writes per-request results");
@@ -370,108 +307,7 @@ void TestAioBatches() {
               }),
           "maximum-sized batch returns all invalid-ID errors");
   }
-  states.fill(42);
-  Check(wait_batch(nullptr, 1, states.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
-            wait_batch(ids.data(), 1, nullptr, 1, nullptr) == Kernel::KERNEL_ERROR_EFAULT &&
-            wait_batch(ids.data(), 0, states.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EINVAL &&
-            wait_batch(ids.data(), 129, states.data(), 1, nullptr) == Kernel::KERNEL_ERROR_EINVAL &&
-            wait_batch(ids.data(), 2, states.data(), 0, nullptr) == Kernel::KERNEL_ERROR_EINVAL &&
-            wait_batch(ids.data(), 2, states.data(), 3, nullptr) == Kernel::KERNEL_ERROR_EINVAL &&
-            states == std::array<int32_t, 3> {42, 42, 42},
-        "invalid wait arguments do not modify outputs");
-  std::array<int32_t, 128> invalid_ids {};
-  std::array<int32_t, 128> errors {};
-  Check(wait_batch(invalid_ids.data(), invalid_ids.size(), errors.data(), 1, nullptr) == OK &&
-            std::all_of(errors.begin(), errors.end(), [](int32_t error) {
-              return error == Kernel::KERNEL_ERROR_ESRCH;
-            }),
-        "maximum-sized wait returns every invalid-ID error");
   Check(FileSystem::KernelClose(fd) == OK, "close AIO read fixture");
-}
-
-void TestNpCommerceDialog() {
-  Loader::SymbolDatabase symbols;
-  Libs::LibNpCommerce::InitNet_1_NpCommerce(&symbols);
-  const auto find = [&](const char *nid) {
-    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
-    Check(symbol != nullptr, "NpCommerce dialog exports resolve");
-    return symbol->vaddr;
-  };
-  using Call = int (KYTY_SYSV_ABI *)();
-  using Open = int (KYTY_SYSV_ABI *)(const void *);
-  using GetResult = int (KYTY_SYSV_ABI *)(void *);
-  const auto initialize = reinterpret_cast<Call>(find("0aR2aWmQal4"));
-  const auto terminate = reinterpret_cast<Call>(find("m-I92Ab50W8"));
-  const auto update = reinterpret_cast<Call>(find("LR5cwFMMCVE"));
-  const auto open = reinterpret_cast<Open>(find("DfSCDRA3EjY"));
-  const auto get_result = reinterpret_cast<GetResult>(find("r42bWcQbtZY"));
-  struct BaseParam {
-    uint64_t size;
-    uint8_t reserved[36];
-    uint32_t magic;
-  };
-  struct Param {
-    BaseParam base;
-    int32_t size, user_id, mode;
-    uint32_t service_label;
-    const char *const *targets;
-    uint32_t num_targets, padding;
-    uint64_t features;
-    void *user_data;
-    uint8_t reserved[32];
-  } param {};
-  struct Result {
-    int32_t result;
-    bool authorized;
-    void *user_data;
-    uint8_t reserved[32];
-  } result {};
-  static_assert(sizeof(Param) == 128 && offsetof(Param, user_data) == 88);
-  static_assert(sizeof(Result) == 48 && offsetof(Result, user_data) == 8);
-  param.base.size = sizeof(BaseParam);
-  param.base.magic = static_cast<uint32_t>(0xC0D1A109u + reinterpret_cast<uintptr_t>(&param.base));
-  param.size = sizeof(param);
-  param.user_id = 1;
-  param.user_data = &symbols;
-  Check(open(&param) == static_cast<int>(0x80B80003u) &&
-            get_result(&result) == static_cast<int>(0x80B80003u),
-        "NpCommerce dialog calls require initialization");
-  Check(initialize() == OK && update() == 1 &&
-            get_result(&result) == static_cast<int>(0x80B80005u),
-        "NpCommerce dialog result requires completion");
-  Check(open(nullptr) == static_cast<int>(0x80B8000Du) && update() == 1 &&
-            get_result(nullptr) == static_cast<int>(0x80B8000Du),
-        "NpCommerce dialog rejects null arguments");
-  Check(open(&param) == OK && update() == 3, "NpCommerce dialog finishes without a store");
-  param.user_data = nullptr;
-  result.authorized = true;
-  Check(get_result(&result) == 1 && result.result == 1 && !result.authorized &&
-            result.user_data == &symbols,
-        "NpCommerce cancellation returns the original user data");
-  param.mode = 5;
-  Check(open(&param) == OK && get_result(&result) == 1 && !result.authorized &&
-            result.user_data == nullptr,
-        "NpCommerce dialog can reopen with fresh result data");
-  const auto invalid_param = [&] {
-    Check(open(&param) == static_cast<int>(0x80B8000Au) && update() == 3 &&
-              get_result(&result) == static_cast<int>(0x80B8000Au) &&
-              result.result == static_cast<int>(0x80B8000Au) && !result.authorized,
-          "NpCommerce dialog reports invalid parameters in the completion result");
-  };
-  param.mode = 99;
-  invalid_param();
-  param.mode = -1;
-  invalid_param();
-  param.mode = 0;
-  param.size = 64;
-  invalid_param();
-  param.size = sizeof(param);
-  param.reserved[0] = 1;
-  invalid_param();
-  param.reserved[0] = 0;
-  Check(open(&param) == OK && get_result(&result) == 1 && terminate() == OK && update() == 0 &&
-            get_result(&result) == static_cast<int>(0x80B80003u),
-        "NpCommerce dialog recovers from invalid parameters and terminates");
 }
 
 void TestNpWebApi2Memory() {
@@ -880,223 +716,6 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
   FileSystem::Umount("/app0");
 }
 
-void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
-  Libs::LibAmpr::InitAmpr_1(&symbols);
-  const auto find = [&](const char *nid) {
-    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
-    Check(symbol != nullptr, "AMPR command and submission exports resolve");
-    return symbol->vaddr;
-  };
-  using Unary = void (KYTY_SYSV_ABI *)(void *);
-  using AprConstructor = void (KYTY_SYSV_ABI *)(void *, void *, void *);
-  using SetBuffer = int (KYTY_SYSV_ABI *)(void *, void *, uint32_t);
-  using Offset = uint64_t (KYTY_SYSV_ABI *)(void *);
-  using WaitAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t,
-                                          uint8_t, uint8_t);
-  using WaitCounter = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint8_t, uint64_t,
-                                          uint8_t, uint8_t, uint64_t, uint8_t);
-  using WriteCounter = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint8_t, uint64_t,
-                                           uint8_t, uint32_t);
-  using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
-  using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
-                                       void *, uint64_t, uint64_t);
-  using WriteKernelEvent = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint64_t,
-                                               uint64_t, uint64_t);
-  struct Result { int32_t result; uint32_t error_offset; };
-  using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
-  using SubmitAmm = int (KYTY_SYSV_ABI *)(void *, uint32_t, uint32_t, uint32_t *);
-  using WaitSubmission = int (KYTY_SYSV_ABI *)(uint32_t);
-  const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
-  const auto construct_apr = reinterpret_cast<AprConstructor>(find("a8uLzYY--tM"));
-  const auto construct_amm = reinterpret_cast<Unary>(find("EDq5bqCqYpA"));
-  const auto destroy = reinterpret_cast<Unary>(find("GuchCTefuZw"));
-  const auto set_buffer = reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"));
-  const auto offset = reinterpret_cast<Offset>(find("GnxKOHEawhk"));
-  const auto wait_address = reinterpret_cast<WaitAddress>(find("DLfoNxTFNVk"));
-  const auto wait_counter = reinterpret_cast<WaitCounter>(find("cQb8Zr8Q0Y0"));
-  const auto write_counter = reinterpret_cast<WriteCounter>(find("jK+yuYCI7MA"));
-  const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
-  const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
-  const auto write_event = reinterpret_cast<WriteKernelEvent>(find("H896Pt-yB4I"));
-  const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
-  const auto submit_amm = reinterpret_cast<SubmitAmm>(find("NnKhlMJtIsI"));
-  const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
-  const auto wait_amm = reinterpret_cast<WaitSubmission>(find("HXymib4T8gc"));
-  struct Buffer {
-    std::array<uint64_t, 5> header {};
-    std::array<uint32_t, 256> data {};
-  };
-  std::array<Buffer, 4> buffers;
-  const auto reset = [&](size_t apr_count) {
-    for (size_t i = 0; i < buffers.size(); ++i) {
-      auto &buffer = buffers[i];
-      construct(buffer.header.data());
-      if (i < apr_count) {
-        construct_apr(buffer.header.data(), &buffer.header[3], &buffer.header[4]);
-      } else {
-        construct_amm(buffer.header.data());
-      }
-      Check(set_buffer(buffer.header.data(), buffer.data.data(), sizeof(buffer.data)) == OK,
-            "initialize AMPR command buffer");
-    }
-  };
-  // WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
-  struct Comparison { uint8_t compare; uint64_t blocked, reference, released; };
-  constexpr std::array comparisons {
-      Comparison{0, 1, 2, 2}, Comparison{1, 0x40000000000019c3, 0x40000000000019c3,
-                                   0x40000000000019c4},
-      Comparison{1, 0, INT64_MAX, uint64_t{1} << 63},
-      Comparison{2, UINT64_MAX, uint64_t{1} << 63, INT64_MAX}, Comparison{3, 2, 2, 3},
-      Comparison{4, UINT64_MAX - 1, UINT64_MAX, 0},
-      Comparison{5, UINT64_MAX, 0, 1}, Comparison{6, 0, 0, UINT64_MAX}};
-  for (const auto &comparison : comparisons) {
-    reset(3);
-    uint64_t fence = comparison.blocked;
-    uint64_t blocked_done = 0, read_done = 0, lower_done = 0;
-    std::array<char, 3> output {};
-    std::array<Result, 3> results {{{1234, 5678}, {1234, 5678}, {1234, 5678}}};
-    std::array<uint32_t, 4> ids {};
-    auto *blocked = buffers[0].header.data();
-    auto *reader = buffers[1].header.data();
-    auto *lower = buffers[2].header.data();
-    auto *producer = buffers[3].header.data();
-    Check(wait_address(blocked, &fence, comparison.reference, comparison.compare, 0) == OK &&
-              write_address(blocked, &blocked_done, 1) == OK &&
-              read_file(reader, reinterpret_cast<uint64_t>(&buffers[1].header[3]),
-                        reinterpret_cast<uint64_t>(&buffers[1].header[4]), file_id,
-                        output.data(), output.size(), 0) == OK &&
-              write_address(reader, &read_done, 2) == OK &&
-              write_address(lower, &lower_done, 3) == OK &&
-              write_address(producer, &fence, comparison.released) == OK,
-          "build dependent APR read and later AMM fence producer");
-    Check(submit_apr(blocked, 3, &results[0], &ids[0]) == OK &&
-              submit_apr(reader, 3, &results[1], &ids[1]) == OK &&
-              submit_apr(lower, 4, &results[2], &ids[2]) == OK && wait_apr(ids[2]) == OK,
-          "APR submit returns while blocked and a lower priority completes");
-    Check(lower_done == 3 && blocked_done == 0 && read_done == 0 &&
-              output == std::array<char, 3>{} && results[0].result == 1234 &&
-              results[1].result == 1234,
-          "unsatisfied wait blocks later buffers at its priority without publishing completion");
-    Check(submit_amm(buffers[3].data.data(), static_cast<uint32_t>(offset(producer)), 1,
-                     &ids[3]) == OK && wait_amm(ids[3]) == OK &&
-              wait_apr(ids[0]) == OK && wait_apr(ids[1]) == OK,
-          "later AMM submission releases the APR dependency");
-    Check(blocked_done == 1 && read_done == 2 && std::memcmp(output.data(), "APR", 3) == 0,
-          "APR reads real file bytes only after its dependency completes");
-    for (const auto &result : results) {
-      Check(result.result == OK,
-            "submission wait observes the completed result");
-    }
-  }
-  constexpr std::array counter_comparisons {
-      Comparison{1, 0, 0, 1}, Comparison{1, 0, 0, 1},
-      Comparison{4, 0x7ffffffe, 0x7fffffff, 0x80000000},
-      Comparison{5, 0xffffffff, 0, 1}};
-  for (const auto &comparison : counter_comparisons) {
-    reset(1);
-    auto *producer = buffers[0].header.data();
-    auto *consumer = buffers[1].header.data();
-    auto *lower = buffers[2].header.data();
-    constexpr uint8_t Counter = 127;
-    constexpr auto Invalid = Libs::LibKernel::KERNEL_ERROR_EINVAL;
-    Check(write_counter(producer, 128, 1, 1, 0, 0) == Invalid &&
-              write_counter(producer, Counter, 8, 1, 0, 0) == Invalid &&
-              write_counter(producer, Counter, 1, 1, 5, 0) == Invalid &&
-              write_counter(producer, Counter, 1, 1, 0, 2) == Invalid &&
-              wait_counter(consumer, Counter, 8, 0, 1, 0, 0, 0) == Invalid &&
-              wait_counter(consumer, Counter, 1, 0, 7, 0, 0, 0) == Invalid &&
-              wait_counter(consumer, Counter, 1, 0, 1, 2, 0, 0) == Invalid &&
-              wait_counter(consumer, Counter, 1, 0, 1, 0, 0, 2) == Invalid &&
-              offset(producer) == 0 && offset(consumer) == 0,
-          "invalid counter operations fail without appending a command");
-    uint64_t retired = 0, lower_done = 0;
-    std::array<char, 3> output {};
-    Result result {1234, 5678};
-    std::array<uint32_t, 4> ids {};
-    if (comparison.blocked != 0) {
-      auto *initializer = buffers[3].header.data();
-      Check(write_counter(initializer, Counter, 1, comparison.blocked, 0, 0) == OK &&
-                submit_amm(buffers[3].data.data(), static_cast<uint32_t>(offset(initializer)),
-                           0, &ids[3]) == OK && wait_amm(ids[3]) == OK,
-            "initialize shared counter before dependent submissions");
-    }
-    Check(read_file(producer, reinterpret_cast<uint64_t>(&buffers[0].header[3]),
-                    reinterpret_cast<uint64_t>(&buffers[0].header[4]), file_id,
-                    output.data(), output.size(), 0) == OK &&
-              write_counter(producer, Counter, 1, comparison.released, 0, 0) == OK &&
-              wait_counter(consumer, Counter, 1, comparison.reference, comparison.compare,
-                           0, 0, 0) == OK &&
-              write_counter(consumer, Counter, 1, 0, 0, 0) == OK &&
-              write_address(consumer, &retired, 1) == OK &&
-              write_address(lower, &lower_done, 1) == OK,
-          "build APR completion and dependent AMM counter reset");
-    Check(submit_amm(buffers[1].data.data(), static_cast<uint32_t>(offset(consumer)),
-                     0, &ids[1]) == OK &&
-              submit_amm(buffers[2].data.data(), static_cast<uint32_t>(offset(lower)),
-                         1, &ids[2]) == OK && wait_amm(ids[2]) == OK &&
-              lower_done == 1 && retired == 0,
-          "counter wait blocks AMM retirement while its lower priority progresses");
-    Check(submit_apr(producer, 3, &result, &ids[0]) == OK && wait_amm(ids[1]) == OK &&
-              wait_apr(ids[0]) == OK && result.result == OK && retired == 1 &&
-              std::memcmp(output.data(), "APR", 3) == 0,
-          "shared counter completion releases AMM only after APR read and resets for reuse");
-  }
-  reset(1);
-  namespace EventQueue = Libs::LibKernel::EventQueue;
-  EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
-  uint64_t ampr_user_data = 1, user_data = 2;
-  Check(EventQueue::KernelCreateEqueue(&queue, "apr-completion") == OK &&
-            EventQueue::KernelAddAmprEvent(queue, 42, &ampr_user_data) == OK &&
-            EventQueue::KernelAddUserEventEdge(queue, 42) == OK,
-        "AMPR and user events can share an identifier");
-  std::array<char, 3> output {};
-  Result event_result {1234, 5678};
-  uint32_t event_submission = 0;
-  auto *reader = buffers[0].header.data();
-  Check(read_file(reader, reinterpret_cast<uint64_t>(&buffers[0].header[3]),
-                  reinterpret_cast<uint64_t>(&buffers[0].header[4]), file_id,
-                  output.data(), output.size(), 0) == OK &&
-            write_event(reader, queue, 42, 0x123456789abc, 0, 0) == OK &&
-            submit_apr(reader, 3, &event_result, &event_submission) == OK &&
-            wait_apr(event_submission) == OK && event_result.result == OK,
-        "APR read submits its completion event");
-  std::array<EventQueue::KernelEvent, 2> events {};
-  int event_count = 0;
-  const Libs::LibKernel::KernelUseconds poll = 0;
-  Check(EventQueue::KernelWaitEqueue(queue, events.data(), 2, &event_count, &poll) == OK &&
-            event_count == 1 && events[0].ident == 42 && events[0].filter == -25 &&
-            events[0].data == 0x123456789abc && events[0].udata == &ampr_user_data &&
-            std::memcmp(output.data(), "APR", 3) == 0,
-        "APR completion reports the AMPR filter, payload and registration user data");
-  Check(EventQueue::KernelDeleteAmprEvent(queue, 42) == OK &&
-            EventQueue::KernelTriggerEvent(queue, 42, -25, nullptr) ==
-                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
-            EventQueue::KernelTriggerUserEvent(queue, 42, &user_data) == OK &&
-            EventQueue::KernelWaitEqueue(queue, events.data(), 2, &event_count, &poll) == OK &&
-            event_count == 1 && events[0].filter == EventQueue::KERNEL_EVFILT_USER &&
-            events[0].udata == &user_data,
-        "deleting AMPR leaves the user event with the same identifier intact");
-  Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete APR completion queue");
-  reset(0);
-  uint64_t cpu_fence = 0, amm_done = 0, lower_done = 0;
-  std::array<uint32_t, 2> ids {};
-  Check(wait_address(buffers[0].header.data(), &cpu_fence, 0, 1, 0) == OK &&
-            write_address(buffers[0].header.data(), &amm_done, 1) == OK &&
-            write_address(buffers[1].header.data(), &lower_done, 1) == OK &&
-            submit_amm(buffers[0].data.data(), static_cast<uint32_t>(offset(buffers[0].header.data())),
-                       0, &ids[0]) == OK &&
-            submit_amm(buffers[1].data.data(), static_cast<uint32_t>(offset(buffers[1].header.data())),
-                       1, &ids[1]) == OK && wait_amm(ids[1]) == OK,
-        "AMM lower priority progresses while its high priority waits");
-  Check(lower_done == 1 && amm_done == 0, "AMM wait preserves its dependency");
-  std::atomic_ref(cpu_fence).store(1, std::memory_order_release);
-  Check(wait_amm(ids[0]) == OK && amm_done == 1,
-        "AMM observes an external CPU fence store without a submission notification");
-  for (auto &buffer : buffers) {
-    destroy(buffer.header.data());
-  }
-}
-
 void CheckAprPaths(const std::filesystem::path &root) {
   Loader::SymbolDatabase symbols;
   Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
@@ -1140,36 +759,6 @@ void CheckAprPaths(const std::filesystem::path &root) {
             ids[0] == 0xffffffffu && ids[1] == expected_id && sizes[0] == 0 && sizes[1] == 3,
         "APR foreach reports a missing path and continues to the valid file");
 
-  // These paths share the old 31-bit FNV-1a ID (0x122d1544).
-  const char *collision_paths[] = {"perf-audit/test_00015ddf.bin",
-                                   "perf-audit/test_000389b8.bin"};
-  Check(std::filesystem::create_directory(root / "perf-audit"), "create APR collision directory");
-  for (size_t i = 0; i < 2; ++i) {
-    Check(fixture.Create(root / collision_paths[i]), "create APR collision fixture");
-    fixture.Write(i == 0 ? "APR" : "OTHER", i == 0 ? 3 : 5);
-    fixture.Close();
-  }
-  uint32_t collision_ids[2] = {};
-  Check(resolve("/app0/", collision_paths, 2, collision_ids, sizes, &error_index) == OK &&
-            collision_ids[0] != collision_ids[1] && collision_ids[0] != 0xffffffffu &&
-            collision_ids[1] != 0xffffffffu && sizes[0] == 3 && sizes[1] == 5,
-        "APR assigns distinct valid IDs to colliding paths");
-  const auto *stat_symbol = symbols.FindByNid("ApkYaHb8Sek", Loader::SymbolType::Func);
-  const auto *size_symbol = symbols.FindByNid("WvEu7yl3Ivg", Loader::SymbolType::Func);
-  Check(stat_symbol && size_symbol, "APR file metadata exports are registered");
-  using Stat = int (KYTY_SYSV_ABI *)(uint32_t, FileSystem::FileStat *);
-  using Size = int (KYTY_SYSV_ABI *)(uint32_t, uint64_t *);
-  for (size_t i = 0; i < 2; ++i) {
-    FileSystem::FileStat stat {};
-    uint64_t size = 0;
-    Check(resolve("/app0/", &collision_paths[i], 1, ids, nullptr, &error_index) == OK &&
-              ids[0] == collision_ids[i] &&
-              reinterpret_cast<Stat>(stat_symbol->vaddr)(ids[0], &stat) == OK &&
-              reinterpret_cast<Size>(size_symbol->vaddr)(ids[0], &size) == OK &&
-              stat.st_size == static_cast<int64_t>(sizes[i]) && size == sizes[i],
-          "APR re-resolution preserves each file's ID, host path and cached size");
-  }
-
   // PATH_MAX includes NUL; all components remain below NAME_MAX (255).
   std::string longest = "/app0/";
   for (int i = 0; i < 3; ++i) {
@@ -1193,7 +782,6 @@ void CheckAprPaths(const std::filesystem::path &root) {
   Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
-  CheckAmprOrdering(symbols, collision_ids[0]);
   FileSystem::Umount("/app0");
 }
 
@@ -1401,76 +989,23 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
 }
 #endif
 
-void CheckEtherAddressFormatting() {
-  Loader::SymbolDatabase symbols;
-  Libs::LibNet::InitNet_1_Net(&symbols);
-  const auto *format_symbol = symbols.FindByNid("v6M4txecCuo", Loader::SymbolType::Func);
-  const auto *errno_symbol = symbols.FindByNid("HQOwnfMGipQ", Loader::SymbolType::Func);
-  Check(format_symbol && errno_symbol, "Ethernet formatting and errno exports resolve");
-  using Format = int (KYTY_SYSV_ABI *)(const Libs::Network::Net::NetEtherAddr *, char *, size_t);
-  using Errno = int *(KYTY_SYSV_ABI *)();
-  const auto format = reinterpret_cast<Format>(format_symbol->vaddr);
-  auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
-  for (const auto address : {Libs::Network::Net::NetEtherAddr{},
-                             Libs::Network::Net::NetEtherAddr{{0x01, 0x23, 0x45, 0xab, 0xcd, 0xef}}}) {
-    const auto *expected = address.data[0] == 0 ? "00:00:00:00:00:00" : "01:23:45:ab:cd:ef";
-    for (const size_t size : {18u, 127u}) {
-      std::array<char, 128> text;
-      text.fill('!');
-      Check(format(&address, text.data(), size) == OK &&
-                std::strcmp(text.data(), expected) == 0 && text[18] == '!',
-            "Ethernet formatting accepts exact and larger buffers");
-    }
-  }
-  const Libs::Network::Net::NetEtherAddr address{};
-  std::array<char, 18> text;
-  text.fill('!');
-  Check(format(&address, text.data(), 17) == Libs::Network::NET_ERROR_EINVAL &&
-            *net_errno == Libs::Posix::POSIX_EINVAL &&
-            std::all_of(text.begin(), text.end(), [](char c) { return c == '!'; }) &&
-            format(nullptr, text.data(), text.size()) == Libs::Network::NET_ERROR_EINVAL &&
-            format(&address, nullptr, text.size()) == Libs::Network::NET_ERROR_EINVAL,
-        "Ethernet formatting rejects invalid arguments without writing output");
-}
-
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
   Libs::LibNet::InitNet_1_Net(&symbols);
-  const auto *connect_symbol = symbols.Find(
-      {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
-  const auto *getsockopt_symbol = symbols.Find(
-      {"xphrZusl78E", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
-  const auto *setsockopt_symbol = symbols.Find(
-      {"2mKX2Spso7I", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *send_symbol = symbols.Find(
       {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
-  const auto *sendto_symbol = symbols.Find(
-      {"gvD1greCu0A", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *recv_symbol = symbols.Find(
       {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
-  const auto *recvfrom_symbol = symbols.Find(
-      {"304ooNZxWDY", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *errno_symbol = symbols.Find(
       {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
-  Check(connect_symbol && getsockopt_symbol && setsockopt_symbol && send_symbol && sendto_symbol &&
-            recv_symbol && recvfrom_symbol && errno_symbol,
-        "Net socket and errno exports resolve with the guest ABI versions");
-  using Connect = int (KYTY_SYSV_ABI *)(int, const void *, uint32_t);
-  using Getsockopt = int (KYTY_SYSV_ABI *)(int, int, int, void *, uint32_t *);
-  using Setsockopt = int (KYTY_SYSV_ABI *)(int, int, int, const void *, uint32_t);
+  Check(send_symbol && recv_symbol && errno_symbol,
+        "Net send, receive and errno exports resolve with the guest ABI versions");
   using Send = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int);
-  using Sendto = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int, const void *, uint32_t);
   using Recv = int (KYTY_SYSV_ABI *)(int, void *, size_t, int);
-  using Recvfrom = int (KYTY_SYSV_ABI *)(int, void *, size_t, int, void *, uint32_t *);
   using Errno = int *(KYTY_SYSV_ABI *)();
-  const auto net_connect = reinterpret_cast<Connect>(connect_symbol->vaddr);
-  const auto net_getsockopt = reinterpret_cast<Getsockopt>(getsockopt_symbol->vaddr);
-  const auto net_setsockopt = reinterpret_cast<Setsockopt>(setsockopt_symbol->vaddr);
   const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
-  const auto net_sendto = reinterpret_cast<Sendto>(sendto_symbol->vaddr);
   const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
-  const auto net_recvfrom = reinterpret_cast<Recvfrom>(recvfrom_symbol->vaddr);
   auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
   const auto [reader, writer] = CreateTcpPair();
   const int enabled = 1;
@@ -1479,15 +1014,10 @@ void CheckSocketWakeup() {
   int socket_error = -1;
   uint32_t error_size = sizeof(socket_error);
   *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
-  *net_errno = Libs::Posix::POSIX_EINVAL;
-  Check(net_getsockopt(writer, 0xffff, 0x1007, &socket_error, &error_size) == 0 &&
+  Check(Net::Getsockopt(writer, 0xffff, 0x1007, &socket_error, &error_size) == 0 &&
             socket_error == 0 && error_size == sizeof(socket_error) &&
-            *net_errno == Libs::Posix::POSIX_EINVAL &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
-        "Net SO_ERROR reports socket status without changing either guest errno");
-  Check(net_getsockopt(writer, 0xffff, 0x1007, nullptr, &error_size) ==
-            Libs::Network::NET_ERROR_EFAULT && *net_errno == Libs::Posix::POSIX_EFAULT,
-        "Net getsockopt translates an invalid output buffer");
+        "SO_ERROR reports socket status without changing guest errno");
 
   std::array<uint64_t, 16> readable {};
   const auto bit = uint64_t {1} << (reader % 64);
@@ -1524,131 +1054,6 @@ void CheckSocketWakeup() {
             *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
         "Net nonblocking receive translates POSIX failure and Net errno");
 #endif
-  const int datagram = Net::Socket(2, 2, 0);
-  const int datagram_writer = Net::Socket(2, 2, 0);
-  std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
-  std::array<uint8_t, 16> peer {}, expected_peer {};
-  uint32_t address_size = address.size(), peer_size = peer.size();
-  uint32_t expected_peer_size = expected_peer.size();
-  Check(datagram >= 0 && datagram_writer >= 0 &&
-            Net::Bind(datagram, address.data(), address.size()) == 0 &&
-            Net::Bind(datagram_writer, address.data(), address.size()) == 0 &&
-            Net::Getsockname(datagram, address.data(), &address_size) == 0 &&
-            Net::Getsockname(datagram_writer, expected_peer.data(), &expected_peer_size) == 0 &&
-            Net::Setsockopt(datagram, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0,
-        "create nonblocking loopback datagrams for Net ABI verification");
-  *net_errno = Libs::Posix::POSIX_EINVAL;
-  *Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EINVAL;
-  for (const int option : {0x1001, 0x1002}) {
-    constexpr int requested = 16384;
-    int actual = 0;
-    uint32_t size = sizeof(actual);
-    Check(net_setsockopt(datagram, 0xffff, option, &requested, sizeof(requested)) == 0 &&
-              net_getsockopt(datagram, 0xffff, option, &actual, &size) == 0 &&
-              actual >= requested && size == sizeof(actual),
-          "Net UDP send and receive buffers accept guest option numbers");
-  }
-  for (const int value : {1, 0}) {
-    int actual = -1;
-    uint32_t size = sizeof(actual);
-    Check(net_setsockopt(datagram, 0xffff, 0x20, &value, sizeof(value)) == 0 &&
-              net_getsockopt(datagram, 0xffff, 0x20, &actual, &size) == 0 &&
-              actual == value && size == sizeof(actual),
-          "Net UDP broadcast option can be enabled and disabled");
-  }
-  int timeout = 0;
-  int *timeout_value = &timeout;
-#if defined(__linux__)
-  int broadcast = -1;
-  uint32_t broadcast_size = sizeof(broadcast);
-  Check(net_setsockopt(datagram, 0xffff, 0x10000, &enabled, sizeof(enabled)) == 0 &&
-            net_getsockopt(datagram, 0xffff, 0x20, &broadcast, &broadcast_size) == 0 &&
-            broadcast == 0,
-        "preserving the all-ones destination does not enable broadcast permission");
-  const long page_size = sysconf(_SC_PAGESIZE);
-  Check(page_size > 0, "get host page size for socket timeout boundary");
-  void *timeout_pages = mmap(nullptr, page_size * 2, PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  Check(timeout_pages != MAP_FAILED &&
-            mprotect(static_cast<char *>(timeout_pages) + page_size, page_size,
-                     PROT_NONE) == 0,
-        "guard memory after the four-byte socket timeout");
-  timeout_value = reinterpret_cast<int *>(static_cast<char *>(timeout_pages) +
-                                           page_size - sizeof(int));
-#endif
-  for (const int value : {1500000, 0, -1}) {
-    *timeout_value = value;
-    Check(net_setsockopt(datagram, 0xffff, 0x1105, timeout_value, sizeof(int)) == 0,
-          "Net send timeout reads a four-byte microsecond value");
-    *timeout_value = -2;
-    uint32_t size = sizeof(int);
-    Check(net_getsockopt(datagram, 0xffff, 0x1105, timeout_value, &size) == 0 &&
-              *timeout_value == std::max(value, 0) && size == sizeof(int),
-          "Net send timeout returns four-byte microseconds and disables nonpositive values");
-  }
-#if defined(__linux__)
-  Check(munmap(timeout_pages, page_size * 2) == 0, "free socket timeout guard pages");
-#endif
-  Check(*net_errno == Libs::Posix::POSIX_EINVAL &&
-            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
-        "successful Net socket option calls preserve both guest errno values");
-  Check(net_setsockopt(datagram, 0xffff, 0x1105, nullptr, sizeof(timeout)) ==
-            Libs::Network::NET_ERROR_EFAULT && *net_errno == Libs::Posix::POSIX_EFAULT &&
-            net_getsockopt(datagram, 0xffff, 0x1105, &timeout, nullptr) ==
-            Libs::Network::NET_ERROR_EFAULT && *net_errno == Libs::Posix::POSIX_EFAULT,
-        "Net socket options reject null value and length pointers");
-  uint32_t short_size = sizeof(timeout) - 1;
-  Check(net_setsockopt(datagram, 0xffff, 0x1105, &timeout, short_size) ==
-            Libs::Network::NET_ERROR_EINVAL && *net_errno == Libs::Posix::POSIX_EINVAL &&
-            net_getsockopt(datagram, 0xffff, 0x1105, &timeout, &short_size) ==
-            Libs::Network::NET_ERROR_EINVAL && *net_errno == Libs::Posix::POSIX_EINVAL,
-        "Net send timeout rejects undersized values");
-  uint32_t option_size = sizeof(timeout);
-  Check(net_setsockopt(datagram, 0xffff, 0x7fffffff, &timeout, option_size) ==
-            Libs::Network::NET_ERROR_ENOPROTOOPT &&
-            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT &&
-            net_getsockopt(datagram, 0xffff, 0x7fffffff, &timeout, &option_size) ==
-            Libs::Network::NET_ERROR_ENOPROTOOPT &&
-            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
-        "Net unknown socket options return protocol-option errors");
-#if defined(__linux__)
-  Check(net_setsockopt(datagram, 0xffff, 0x1007, &timeout, option_size) ==
-            Libs::Network::NET_ERROR_ENOPROTOOPT &&
-            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
-        "Net native protocol-option errors retain their guest error code");
-#endif
-  received.fill(0);
-  *net_errno = Libs::Posix::POSIX_EINVAL;
-  Check(net_sendto(datagram_writer, payload, sizeof(payload), 0,
-                   address.data(), address_size) == sizeof(payload) &&
-            *net_errno == Libs::Posix::POSIX_EINVAL,
-        "Net sendto delivers to a guest sockaddr and preserves errno on success");
-  Check(net_recvfrom(datagram, received.data(), received.size(), 0,
-                     peer.data(), &peer_size) == sizeof(payload) &&
-            std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
-            peer_size == expected_peer_size && peer == expected_peer &&
-            *net_errno == Libs::Posix::POSIX_EINVAL,
-        "Net recvfrom returns datagram bytes and sender address while preserving errno");
-  Check(net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
-            Libs::Network::NET_ERROR_EWOULDBLOCK &&
-            *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
-        "Net recvfrom translates nonblocking failure with an omitted sender address");
-  *net_errno = Libs::Posix::POSIX_EINVAL;
-  Check(net_connect(datagram_writer, address.data(), address_size) == 0 &&
-            *net_errno == Libs::Posix::POSIX_EINVAL &&
-            net_sendto(datagram_writer, payload, sizeof(payload), 0, nullptr, 0) ==
-                sizeof(payload) && *net_errno == Libs::Posix::POSIX_EINVAL &&
-            net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
-                sizeof(payload) && std::memcmp(received.data(), payload, sizeof(payload)) == 0,
-        "Net connect selects the peer used by sendto with an omitted destination");
-  Check(net_connect(-1, address.data(), address_size) == Libs::Network::NET_ERROR_EBADF &&
-            *net_errno == Libs::Posix::POSIX_EBADF,
-        "Net connect translates an invalid socket");
-  Check(net_sendto(-1, payload, sizeof(payload), 0, address.data(), address_size) ==
-            Libs::Network::NET_ERROR_EBADF && *net_errno == Libs::Posix::POSIX_EBADF,
-        "Net sendto translates an invalid socket");
-  Check(Net::SocketClose(datagram) == 0 && Net::SocketClose(datagram_writer) == 0,
-        "close Net loopback datagrams");
   Check(net_send(-1, payload, sizeof(payload), 0) == Libs::Network::NET_ERROR_EBADF &&
             *net_errno == Libs::Posix::POSIX_EBADF,
         "Net send translates an invalid socket instead of returning POSIX minus one");
@@ -1665,12 +1070,10 @@ void CheckSocketWakeup() {
   const auto previous_sigpipe = std::signal(SIGPIPE, SIG_DFL);
   Check(previous_sigpipe != SIG_ERR, "set default SIGPIPE disposition for Net send");
   const auto broken_send = net_send(disconnected, payload, sizeof(payload), 0);
-  const auto broken_sendto = net_sendto(disconnected, payload, sizeof(payload), 0, nullptr, 0);
   std::signal(SIGPIPE, previous_sigpipe);
   Check(broken_send == Libs::Network::NET_ERROR_EPIPE &&
-            broken_sendto == Libs::Network::NET_ERROR_EPIPE &&
             *net_errno == Libs::Posix::POSIX_EPIPE,
-        "Net send and sendto report a broken pipe without raising host SIGPIPE");
+        "Net send reports a broken pipe without raising host SIGPIPE");
   Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
 #endif
 #if defined(_WIN32)
@@ -1713,10 +1116,6 @@ int main(int, char**) {
 
   TempDirectory temporary;
   FileSystem::Initialize();
-  TestSysmoduleReferences();
-  TestSystemServiceEntitlementEvents();
-  TestRandomDevices();
-  TestFileDescriptorFlags();
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());
   CheckArchiveMount(temporary.Path());
@@ -1724,6 +1123,9 @@ int main(int, char**) {
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
+#ifdef _WIN32
+  CheckReadIntoProtectedMemory(temporary.Path());
+#endif
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
   TestAioBatches();
@@ -1731,9 +1133,7 @@ int main(int, char**) {
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
   CheckSocketWakeup();
-  CheckEtherAddressFormatting();
   TestNpWebApi2Memory();
-  TestNpCommerceDialog();
   graphics.reset();
   subsystems.Destroy();
 

@@ -3,8 +3,10 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/cpuPlacement.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/hangTrace.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -12,6 +14,9 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/eopTimestamps.h"
+#include "graphics/host_gpu/renderer/gpuOpProfiler.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -19,6 +24,7 @@
 #include "graphics/presentation/framePacer.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "kernel/eventQueueFilters.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -218,6 +224,7 @@ public:
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
+	bool IsPending(VideoOutConfig& cfg, int index);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -313,17 +320,9 @@ static VideoOutEventQueues& VideoOutEventQueuesFor(VideoOutEventState& state,
 }
 
 static intptr_t MakeVideoOutEventData(intptr_t current_data, void* trigger_data) {
-	const uint64_t old_data = static_cast<uint64_t>(current_data);
-	uint64_t       counter  = (old_data >> 12u) & 0xfu;
-	if (counter != 0xfu) {
-		counter++;
-	}
-
-	const uint64_t time    = LibKernel::KernelReadTsc() & 0xfffu;
-	const uint64_t payload = static_cast<uint64_t>(reinterpret_cast<intptr_t>(trigger_data));
-
-	return static_cast<intptr_t>(time | (counter << 12u) |
-	                             ((payload & 0x0000ffffffffffffULL) << 16u));
+	return EventQueue::VideoOutEventData(
+	    current_data, static_cast<uint64_t>(reinterpret_cast<intptr_t>(trigger_data)),
+	    LibKernel::KernelReadTsc());
 }
 
 static void ResetVideoOutEvent(EventQueue::KernelEqueueEvent* event) {
@@ -333,19 +332,16 @@ static void ResetVideoOutEvent(EventQueue::KernelEqueueEvent* event) {
 	event->event.data   = 0;
 }
 
+// Occurrences the guest has not consumed yet merge into the pending event: the counter
+// (sceVideoOutGetEventCount) counts them and the payload is the newest one. KYTY_EQUEUE_COALESCE=0
+// restores the old one-copy-per-occurrence queue.
 static void TriggerVideoOutEvent(EventQueue::KernelEqueueEvent* event, void* trigger_data) {
 	EXIT_IF(event == nullptr);
 
-	auto triggered_event = event->event;
-	triggered_event.fflags =
-	    triggered_event.fflags < 0xfu ? triggered_event.fflags + 1u : triggered_event.fflags;
-	triggered_event.data = MakeVideoOutEventData(triggered_event.data, trigger_data);
-	if (event->triggered) {
-		event->pending_events.push_back(triggered_event);
-		return;
-	}
-	event->event     = triggered_event;
-	event->triggered = true;
+	EventQueue::KernelEqueueApplyTrigger(
+	    event, EventQueue::VideoOutNextState(
+	               event->event, static_cast<uint64_t>(reinterpret_cast<intptr_t>(trigger_data)),
+	               LibKernel::KernelReadTsc()));
 }
 
 static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
@@ -856,9 +852,13 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	// A 120 Hz timer loop that blocks between vblanks; it presents and fires the flip events the
+	// guest waits for. Its only spin is the last <= 50 us of a vblank wait (SleepMicro).
+	Common::RaiseServiceThreadPriority();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
+	uint32_t placement_count = 0; // placement samples (common/cpuPlacement.h), every 8th vblank
 	Graphics::FramePacer pacer(frequency, Common::Timer::QueryPerformanceCounter());
 	const auto           sleep_until = [frequency](uint64_t deadline) {
         const auto now = Common::Timer::QueryPerformanceCounter();
@@ -868,6 +868,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
             std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
 	};
 	while (!token.stop_requested()) {
+		if ((++placement_count & 7u) == 0u) {
+			Common::SamplePlacement(Common::ThreadRole::Host);
+		}
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		const auto vblank      = sleep_begin + pacer.Remaining(sleep_begin);
 		// Frame Generation shows the real frame between vblanks. A later deadline
@@ -1039,6 +1042,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	m_submit_slot_cond_var.SignalAll();
 	m_submit_cond_var.SignalAll();
 	m_mutex.Unlock();
+	m_presenter.Renderer().NotifyGpuProgress();
 	for (auto* frame: frames) {
 		m_presenter.Discard(*frame);
 	}
@@ -1215,6 +1219,13 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
+bool FlipQueue::IsPending(VideoOutConfig& cfg, int index) {
+	Common::LockGuard lock(m_mutex);
+	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
+	       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+}
+
 bool FlipQueue::Flip(uint32_t micros) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
@@ -1336,7 +1347,27 @@ bool FlipQueue::Flip(uint32_t micros) {
 		requests[i - 1].cfg->mutex.Unlock();
 	}
 	if (due) {
+		// A guest queue may be suspended in WAIT_FLIP_DONE on this buffer.
+		m_presenter.Renderer().NotifyGpuProgress();
+
 		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
+		// A completed guest flip (one per presented layer group), not the polling iterations of
+		// FlipQueue::Flip. This is a CPU presentation marker; it does not measure GPU execution
+		// time.
+		if (tracy::ProfilerAvailable()) {
+			FrameMarkNamed("Guest flip completed");
+		}
+		// KYTY_GPU_TIMING: fold command buffers completed since the previous flip into this flip's
+		// GPU busy/idle totals before the aggregate snapshot below is published.
+		Graphics::GpuOpProfiler::OnGuestFlip();
+		Graphics::GpuTiming::OnGuestFlip();
+		// With the hang trace: guest timestamp rewrites, timer-ring deltas and the DRS state.
+		Graphics::EopTimestamps::OnGuestFlip();
+		Profiler::PublishFrameWork();
+		HangTrace::RecordFlip();
+		m_presenter.Renderer().GetTextureCache().AdvanceFrame();
+		m_presenter.Renderer().GetBufferCache().AdvanceFrame();
+
 		if (Config::GraphicsDebugDumpEnabled() &&
 		    Config::GetPrintfDirection() != Config::LogDirection::Silent) {
 			LOGF("Flip done: %d\n", requests[0].index);
@@ -1683,6 +1714,14 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	auto* cfg = m_impl->Get(handle);
 	EXIT_IF(cfg == nullptr);
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
+}
+
+bool VideoOutDriver::IsFlipPending(int handle, int index) {
+	auto* ctx = m_impl->Get(handle);
+	EXIT_IF(ctx == nullptr);
+
+	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
+	return m_impl->GetFlipQueue().IsPending(*ctx, index);
 }
 
 void VideoOutDriver::WaitFlipDone(int handle, int index) {

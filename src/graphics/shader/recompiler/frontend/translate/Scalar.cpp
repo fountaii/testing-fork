@@ -17,9 +17,12 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CSELECT_B32: S_CSELECT_B32(inst); return;
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
+		case O::S_CMOV_B32:
+		case O::S_CMOVK_I32: S_CMOV_B32(inst); return;
+		case O::S_SEXT_I32_I8: S_SEXT_I32(inst, 8u); return;
+		case O::S_SEXT_I32_I16: S_SEXT_I32(inst, 16u); return;
 		case O::S_SETREG_B32: EmitControlNop(); return;
-		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
-		case O::S_WAITCNT: return;
+		case O::S_WAITCNT: S_WAITCNT(inst); return;
 
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
@@ -38,6 +41,41 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return;
 		case O::S_ORN2_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, true);
+			return;
+		case O::S_OR_SAVEEXEC_B32:
+		case O::S_OR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false,
+			           inst.opcode == O::S_OR_SAVEEXEC_B64);
+			return;
+		case O::S_XOR_SAVEEXEC_B32:
+		case O::S_XOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false,
+			           inst.opcode == O::S_XOR_SAVEEXEC_B64);
+			return;
+		case O::S_ANDN2_SAVEEXEC_B32:
+		case O::S_ANDN2_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false,
+			           inst.opcode == O::S_ANDN2_SAVEEXEC_B64);
+			return;
+		case O::S_ORN1_SAVEEXEC_B32:
+		case O::S_ORN1_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, true,
+			           inst.opcode == O::S_ORN1_SAVEEXEC_B64);
+			return;
+		case O::S_NAND_SAVEEXEC_B32:
+		case O::S_NAND_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false,
+			           inst.opcode == O::S_NAND_SAVEEXEC_B64, true);
+			return;
+		case O::S_NOR_SAVEEXEC_B32:
+		case O::S_NOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false,
+			           inst.opcode == O::S_NOR_SAVEEXEC_B64, true);
+			return;
+		case O::S_XNOR_SAVEEXEC_B32:
+		case O::S_XNOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false,
+			           inst.opcode == O::S_XNOR_SAVEEXEC_B64, true);
 			return;
 		case O::S_ADD_U32: ADD_U32(inst, false, false); return;
 		case O::S_ADDC_U32: ADD_U32(inst, false, true); return;
@@ -134,14 +172,6 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_ABS_I32:
 			return SimpleInteger(inst, IR::ValueOpcode::IAbs32, IR::Type::U32, false, false, true);
-		case O::S_SEXT_I32_I8:
-		case O::S_SEXT_I32_I16: {
-			// Sign extension leaves SCC unchanged.
-			const auto bits = inst.opcode == O::S_SEXT_I32_I8 ? 8u : 16u;
-			WriteOperand(inst.dst, IR::U32(ir.Emit(IR::ValueOpcode::BitFieldSExtract,
-			    {ReadU32(inst.src0), IR::Value(0u), IR::Value(bits)})));
-			return;
-		}
 		case O::S_MUL_I32:
 		case O::S_MULK_I32:
 			return SimpleInteger(inst, IR::ValueOpcode::IMul32, IR::Type::U32, false, false, false);
@@ -173,16 +203,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BCNT1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitCount32, IR::Type::U32, false, false,
 			                     true);
-		case O::S_BCNT1_I32_B64: {
-			// Vulkan bit counts operate on 32-bit words; avoid packing only to split again.
-			const auto value  = ReadU32Pair(inst.src0);
-			const auto low    = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[0]}));
-			const auto high   = IR::U32(ir.Emit(IR::ValueOpcode::BitCount32, {value[1]}));
-			const auto result = ir.IAdd(low, high);
-			WriteOperand(inst.dst, result);
-			ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
-			return;
-		}
+		case O::S_BCNT1_I32_B64:
+			return SimpleInteger(inst, IR::ValueOpcode::BitCount64, IR::Type::U64, false, false,
+			                     true);
 		case O::S_FF1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::FindILsb32, IR::Type::U32, false, false,
 			                     false);
@@ -239,8 +262,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_NOP:
 		case O::S_SLEEP:
 		case O::S_SETPRIO:
+		case O::S_CLAUSE:
 		case O::S_TRAP: EmitControlNop(); return;
-		case O::S_WAITCNT_DEPCTR: return;
+		case O::S_WAITCNT_DEPCTR: EmitWaitcnt(); return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;
 		case O::S_TTRACEDATA: S_TTRACEDATA(); return;

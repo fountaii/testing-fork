@@ -8,6 +8,7 @@
 #include "common/file.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/memory.h"
@@ -70,7 +71,6 @@ struct File {
 	std::atomic_bool                    writable;
 	std::atomic_bool                    append;
 	std::atomic_bool                    sync_writes;
-	std::atomic_bool                    close_on_exec;
 	SpecialFile                         special;
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
@@ -450,12 +450,11 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	EXIT_IF(file == nullptr || file->opened || file->directory);
 
-	file->name          = path;
-	file->readable      = rw_mode != Common::File::Mode::Write;
-	file->writable      = rw_mode != Common::File::Mode::Read;
-	file->append        = append;
-	file->sync_writes   = fsync || sync || dsync;
-	file->close_on_exec = (static_cast<uint32_t>(flags) & 0x00100000u) != 0;
+	file->name        = path;
+	file->readable    = rw_mode != Common::File::Mode::Write;
+	file->writable    = rw_mode != Common::File::Mode::Read;
+	file->append      = append;
+	file->sync_writes = fsync || sync || dsync;
 
 	if (!directory && IsRandomDevice(file->name)) {
 		file->real_name = file->name;
@@ -585,27 +584,6 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	g_files->DeleteDescriptor(d);
 
 	return OK;
-}
-
-int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
-	PRINT_NAME();
-
-	if (d < DESCRIPTOR_MIN) {
-		return KERNEL_ERROR_EBADF;
-	}
-
-	auto* file = g_files->GetFile(d);
-	if (file == nullptr || !file->opened) {
-		return KERNEL_ERROR_EBADF;
-	}
-
-	switch (command) {
-		case 1: return file->close_on_exec.load(std::memory_order_relaxed); // F_GETFD
-		case 2: // F_SETFD, FD_CLOEXEC
-			file->close_on_exec.store((arg & 1) != 0, std::memory_order_relaxed);
-			return OK;
-		default: return KERNEL_ERROR_EINVAL;
-	}
 }
 
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
@@ -742,22 +720,28 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
 	PRINT_NAME();
+	Profiler::ScopedLoadingOperation loading(Profiler::LoadingOperation::Pread);
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadRequestedBytes, nbytes);
 
 	if (d < DESCRIPTOR_MIN) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		return KERNEL_ERROR_EPERM;
 	}
 
 	if (buf == nullptr) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		return KERNEL_ERROR_EFAULT;
 	}
 
 	if (offset < 0) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		return KERNEL_ERROR_EINVAL;
 	}
 
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -769,6 +753,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	if (file->special == SpecialFile::Random) {
 		FillRandomBuffer(buf, nbytes);
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadReadBytes, nbytes);
 
 		LOGF("\tRead %" PRIu64 " random bytes (pos = %" PRId64 ") from: %s\n",
 		     static_cast<uint64_t>(nbytes), offset, Common::PathToString(file->real_name).c_str());
@@ -776,23 +761,33 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return static_cast<int64_t>(nbytes);
 	}
 
+	Profiler::ScopedLoadingOperation mutex_wait(Profiler::LoadingOperation::PreadFileMutex);
 	file->mutex.Lock();
+	mutex_wait.End();
 
 	bool       is_invalid = file->f.IsInvalid();
 	auto       pos        = file->f.Tell();
 	const auto file_size  = file->f.Size();
 	const auto remaining =
 	    static_cast<uint64_t>(offset) < file_size ? file_size - static_cast<uint64_t>(offset) : 0;
-	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
-	                         std::min<uint64_t>(nbytes, remaining));
+	{
+		Profiler::ScopedLoadingOperation coherence(Profiler::LoadingOperation::PreadCoherence);
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
+		                         std::min<uint64_t>(nbytes, remaining));
+	}
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	{
+		Profiler::ScopedLoadingOperation native_read(Profiler::LoadingOperation::PreadNativeRead);
+		file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	}
+	Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadReadBytes, bytes_read);
 	file->f.Seek(pos);
 
 	file->mutex.Unlock();
 
 	if (is_invalid) {
+		Profiler::CountLoadingEvent(Profiler::LoadingEvent::PreadErrors);
 		LOGF("\tfile is invalid\n");
 		return KERNEL_ERROR_EIO;
 	}
@@ -1161,11 +1156,19 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	auto wt = at;
 
 	if (file->special != SpecialFile::None) {
-		stat.st_mode    = 0020644u;
 		stat.st_size    = 0;
 		stat.st_blksize = 512;
 		stat.st_blocks  = 0;
-	} else if (!file->directory) {
+		SecToTimespec(&stat.st_atim, at.ToUnix());
+		SecToTimespec(&stat.st_mtim, wt.ToUnix());
+		stat.st_ctim     = stat.st_atim;
+		stat.st_birthtim = stat.st_mtim;
+		*sb              = stat;
+
+		return OK;
+	}
+
+	if (!file->directory) {
 		file->mutex.Lock();
 
 		bool is_invalid = file->f.IsInvalid();

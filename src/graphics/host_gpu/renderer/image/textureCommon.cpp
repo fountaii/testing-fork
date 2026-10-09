@@ -35,9 +35,6 @@ struct HostFormatInfo {
 
 HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
                                  Prospero::ChannelOrder order) {
-	if (guest_format == Prospero::BufferFormat::k10_11_11Float) {
-		return {vk::Format::eB10G11R11UfloatPack32, Prospero::ColorMappingBgra};
-	}
 	if (order == Prospero::ChannelOrder::kAlt) {
 		switch (guest_format) {
 			case Prospero::BufferFormat::k8_8_8_8UNorm:
@@ -134,8 +131,7 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layo
 		if (host_format.format != vk::Format::eUndefined && bytes != 0) {
 			const auto order_mapping =
 			    kRenderTargetColorMappings[static_cast<size_t>(order)][encoding.components - 1u];
-			return {host_format.format, bytes, host_format.host_to_storage.Then(order_mapping),
-			        encoding.buffer_format};
+			return {host_format.format, bytes, host_format.host_to_storage.Then(order_mapping)};
 		}
 	}
 	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n",
@@ -176,10 +172,40 @@ SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
 	EXIT("unknown format: fmt = %u\n", static_cast<uint32_t>(format));
 }
 
+// Mirrors the unsupported-layout exits of TextureCalcUploadLayout without exiting, so paths that
+// have an exact fallback (e.g. downloads before a GPU write) can decline instead of stopping.
+bool TextureUploadLayoutSupported(Prospero::BufferFormat format, uint32_t width, uint32_t height,
+                                  uint32_t levels, uint32_t depth, Prospero::TileMode tile_mode,
+                                  bool allow_depth_tile, bool volume_texture) {
+	if (format == Prospero::BufferFormat::kInvalid) {
+		return false;
+	}
+	if (tile_mode == Prospero::TileMode::kLinear) {
+		TileTextureElementLayout element {};
+		return TileGetTextureElementLayout(format, element);
+	}
+	if (tile_mode == Prospero::TileMode::kDepth && !allow_depth_tile) {
+		return false;
+	}
+	const TileSurfaceDescription description {
+	    format,
+	    tile_mode,
+	    volume_texture ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+	    width,
+	    height,
+	    volume_texture ? depth : 1u,
+	    levels,
+	    volume_texture ? 1u : depth,
+	};
+	TileSurfaceLayout surface {};
+	return TileGetTiledTextureLayout(description, surface);
+}
+
 TextureUploadLayout TextureCalcUploadLayout(Prospero::BufferFormat format, uint32_t width,
                                             uint32_t height, uint32_t levels, uint32_t depth,
                                             Prospero::TileMode tile_mode, uint64_t upload_size,
-                                            bool volume_texture, const char* owner) {
+                                            bool allow_depth_tile, bool volume_texture,
+                                            const char* owner) {
 	TextureUploadLayout layout {};
 	layout.surface.description = {
 	    format,
@@ -207,7 +233,8 @@ TextureUploadLayout TextureCalcUploadLayout(Prospero::BufferFormat format, uint3
 			     static_cast<uint32_t>(format));
 		}
 	} else {
-		if (!TileGetTiledTextureLayout(description, layout.surface)) {
+		if ((tile_mode == Prospero::TileMode::kDepth && !allow_depth_tile) ||
+		    !TileGetTiledTextureLayout(description, layout.surface)) {
 			EXIT("%s: unsupported typed tiled upload: fmt=%u tile=%u "
 			     "size=%" PRIu64 " extent=%ux%u levels=%u\n",
 			     owner, static_cast<uint32_t>(format), static_cast<uint32_t>(tile_mode),
