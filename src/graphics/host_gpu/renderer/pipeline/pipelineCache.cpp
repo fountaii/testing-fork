@@ -4824,9 +4824,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
-    GraphicsStagePreps& stage_preps) {
+    GraphicsStagePreps& stage_preps, bool allow_geometry_motion) {
 	KYTY_PROFILER_DETAIL_FUNCTION();
-	const bool tess_active = TessellationActive(user_config);
+	const bool                  tess_active = TessellationActive(user_config);
 	std::array<ShaderParams, 3> vertex_params;
 	// Static stage information (shader map, headers, vertex tables); ended before
 	// materialization.
@@ -4838,6 +4838,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
+	vertex_info[0].geometry_motion_dword = pixel_info.geometry_motion_dword = UINT32_MAX;
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
 		FinishMeshStage(m_graphics, vertex_info[0]);
@@ -4850,26 +4851,31 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	ApplyClipSpace(m_graphics, context, vertex_info[tess_active ? 2u : 0u]);
 	static_zone.End();
 	// The program cache locks internally, so no pipeline lock is held across materialization.
-	auto& scratch    = ProgramCache::ThreadScratch();
-	auto& evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
-	const uint32_t push_data_start =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
-	                      vertex_info[0].mesh.split_groups != 0)
-	                : 0;
+	auto&    scratch    = ProgramCache::ThreadScratch();
+	auto&    evaluation = ShaderRecompiler::IR::ThreadEvaluationScratch();
+	uint32_t push_data_start =
+	    mesh_active
+	        ? ShaderRecompiler::IR::PushData::MeshDrawDwords(vertex_info[0].mesh.split_groups != 0)
+	        : 0;
+	pixel_info.raster_scale_dword = UINT32_MAX;
+	if (pixel_active && (pixel_info.ps_pos_x || pixel_info.ps_pos_y)) {
+		pixel_info.raster_scale_dword = push_data_start;
+		push_data_start += 2;
+	}
 	const auto serial = [&](std::array<ShaderVertexInputInfo, 3>& vertex_inputs,
-	                        ShaderPixelInputInfo& pixel_input,
-	                        GraphicsStagePreps& preps) -> GraphicsPrograms {
+	                        ShaderPixelInputInfo&                 pixel_input,
+	                        GraphicsStagePreps&                   preps) -> GraphicsPrograms {
 		for (uint32_t attempt = 0; attempt < 64; ++attempt) {
 			ShaderReadAttempt read_attempt;
 			uint32_t          push_data_cursor = push_data_start;
 			GraphicsPrograms  result;
 			if (pixel_active) {
-				result.pixel = m_program_cache->Get(pixel_params, pixel_input, preps.pixel,
-				                                   push_data_cursor, read_attempt, scratch,
-				                                   evaluation);
+				result.pixel =
+				    m_program_cache->Get(pixel_params, pixel_input, preps.pixel, push_data_cursor,
+				                         read_attempt, scratch, evaluation);
 			}
-			for (uint32_t i = 0; i < (tess_active ? 3u : 1u) &&
-			                     !read_attempt.materialization_failed; ++i) {
+			for (uint32_t i = 0;
+			     i < (tess_active ? 3u : 1u) && !read_attempt.materialization_failed; ++i) {
 				result.vertex[i] =
 				    m_program_cache->Get(vertex_params[i], vertex_inputs[i], preps.vertex[i],
 				                         push_data_cursor, read_attempt, scratch, evaluation);
@@ -4881,21 +4887,77 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 		EXIT("graphics resource readiness did not converge after 64 attempts\n");
 	};
-	// Draw-prep S3: PS and VS materialized concurrently. The O15 reuse mode keeps shared
-	// per-entry state and tessellation has three vertex stages; both stay serial.
-	if (pixel_active && !tess_active && !ResourceReuseEnabled()) {
-		GraphicsPrograms result;
-		if (m_program_cache->TryGetParallel(pixel_params, pixel_info, stage_preps.pixel,
-		                                    vertex_params[0], vertex_info[0], stage_preps.vertex[0],
-		                                    push_data_start, scratch, evaluation, result.pixel,
-		                                    result.vertex[0])) {
-			if (StagePrepVerifyMode() != 0) {
-				VerifyParallelPrograms(result, vertex_info, pixel_info, stage_preps, serial);
+	const auto prepare = [&]() -> GraphicsPrograms {
+		// Draw-prep S3: PS and VS materialized concurrently. The O15 reuse mode keeps shared
+		// per-entry state and tessellation has three vertex stages; both stay serial.
+		if (pixel_active && !tess_active && !ResourceReuseEnabled()) {
+			GraphicsPrograms result;
+			if (m_program_cache->TryGetParallel(pixel_params, pixel_info, stage_preps.pixel,
+			                                    vertex_params[0], vertex_info[0],
+			                                    stage_preps.vertex[0], push_data_start, scratch,
+			                                    evaluation, result.pixel, result.vertex[0])) {
+				if (StagePrepVerifyMode() != 0) {
+					VerifyParallelPrograms(result, vertex_info, pixel_info, stage_preps, serial);
+				}
+				return result;
 			}
-			return result;
+		}
+		return serial(vertex_info, pixel_info, stage_preps);
+	};
+	// The fork publishes stage interfaces when the program is materialized, rather
+	// than during static preparation. Inspect that ordinary permutation first;
+	// cached draws reuse it, and unsupported stages return it directly.
+	const auto ordinary = prepare();
+	if (!allow_geometry_motion || !pixel_active || mesh_active || tess_active ||
+	    !vertex_info[0].stage.program || !pixel_info.stage.program)
+		return ordinary;
+	// Reserve spare interfaces only when ordinary guest vertex/fragment stages
+	// leave them unused. This is based on shader interfaces, never title hashes.
+	using namespace ShaderRecompiler;
+	const auto&           vs = *vertex_info[0].stage.program;
+	std::vector<uint32_t> active_pixel_inputs;
+	if (pixel_active) {
+		for (const auto& in: pixel_info.stage.program->info.inputs) {
+			if (in.kind == IR::StageInputKind::Parameter)
+				active_pixel_inputs.push_back(in.location);
 		}
 	}
-	return serial(vertex_info, pixel_info, stage_preps);
+	// allow_geometry_motion carries whether presentation consumes temporal inputs.
+	const bool motion_candidate =
+	    allow_geometry_motion && pixel_active && !mesh_active && !tess_active &&
+	    !context.GetClipControl().clip_disable && !pixel_info.dual_source_blending &&
+	    (!context.GetBlendControl(0).enable || context.GetRenderTarget(0).info.blend_bypass) &&
+	    !pixel_info.ps_depth_export_enable && !pixel_info.ps_sample_mask_export_enable &&
+	    !vs.has_address_writes && (vs.param_export_mask & 0xfc000000u) == 0 &&
+	    context.GetRenderTarget(0).attrib.num_fragments == 0 &&
+	    context.GetDepthZInfo().num_samples == 0 &&
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxColorAttachments >= 8 &&
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxVertexOutputComponents >= 128 &&
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxFragmentInputComponents >= 128 &&
+	    std::ranges::any_of(
+	        vs.info.outputs,
+	        [](const auto& out) { return out.kind == IR::StageOutputKind::Position; }) &&
+	    std::ranges::all_of(vs.info.outputs,
+	                        [](const auto& out) {
+		                        return out.kind != IR::StageOutputKind::Layer &&
+		                               out.kind != IR::StageOutputKind::ViewportIndex;
+	                        }) &&
+	    std::ranges::all_of(pixel_info.stage.program->info.outputs,
+	                        [](const auto& out) {
+		                        return out.kind != IR::StageOutputKind::Mrt || out.index == 0;
+	                        }) &&
+	    std::ranges::all_of(pixel_info.stage.program->info.inputs, [&](const auto& in) {
+		    return in.kind != IR::StageInputKind::Parameter ||
+		           ShaderPixelParameterLocation(pixel_info, active_pixel_inputs, in.location) < 26;
+	    });
+	if (!motion_candidate) return ordinary;
+	vertex_info[0].geometry_motion_dword = pixel_info.geometry_motion_dword = 0;
+	push_data_start                                                         = 14;
+	if (pixel_info.raster_scale_dword != UINT32_MAX) {
+		pixel_info.raster_scale_dword = push_data_start;
+		push_data_start += 2;
+	}
+	return prepare();
 }
 
 PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculative(
@@ -4927,10 +4989,15 @@ PipelineCache::SpeculativeResult PipelineCache::PrepareGraphicsProgramsSpeculati
 	if (read_failed()) {
 		return SpeculativeResult::ReadFailed;
 	}
-	const uint32_t push_data_start = vertex_info.logical_stage == ShaderType::Mesh
+	uint32_t push_data_start = vertex_info.logical_stage == ShaderType::Mesh
 	                                     ? ShaderRecompiler::IR::PushData::MeshDrawDwords(
 	                                           vertex_info.mesh.split_groups != 0)
 	                                     : 0;
+	pixel_info.raster_scale_dword = UINT32_MAX;
+	if (pixel_active && (pixel_info.ps_pos_x || pixel_info.ps_pos_y)) {
+		pixel_info.raster_scale_dword = push_data_start;
+		push_data_start += 2;
+	}
 	const bool compile_ahead = g_program_prefetch.On();
 	const auto result = m_program_cache->TryPrepareSpeculative(
 	    pixel_active, pixel_params, pixel_info, pixel_prep, vertex_params, vertex_info, vertex_prep,
@@ -5118,6 +5185,12 @@ bool PipelineCache::BuildGraphicsPipelineKey(const PipelineTargets& targets, con
 				static_params.blend_alpha_source_remap = true;
 			}
 		}
+	}
+	if (ps_active && ps_input_info->geometry_motion_dword != UINT32_MAX) {
+		rendering.color_count         = 8;
+		rendering.color_formats[7]    = vk::Format::eR16G16B16A16Sfloat;
+		static_params.color_mask[7]   = 0xf;
+		static_params.blend_enable[7] = false;
 	}
 	const bool with_depth = targets.with_depth;
 	if (with_depth) {

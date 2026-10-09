@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/rasterScale.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -57,6 +58,7 @@
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -567,6 +569,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandS
 
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
+	const auto&        effective = buffer.EffectiveRenderState();
+	const float        scale_x   = float(effective.width) / rendering.width;
+	const float        scale_y   = float(effective.height) / rendering.height;
 	const vk::Extent2D framebuffer_extent {rendering.width, rendering.height};
 	constexpr uint32_t viewport_slots = std::size(HW::ScreenViewport {}.viewports);
 	std::array<vk::Viewport, viewport_slots> viewports {};
@@ -626,6 +631,15 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandS
 				DrawPrep::ReportBindingMismatch("dynamic viewports", viewport_count);
 			}
 		}
+	}
+	for (uint32_t i = 0; i < viewport_count; ++i) {
+		auto& viewport = viewports[i];
+		viewport.x *= scale_x;
+		viewport.y *= scale_y;
+		viewport.width *= scale_x;
+		viewport.height *= scale_y;
+		scissors[i] = ScaleRasterScissor(scissors[i], scale_x, scale_y,
+		                                {effective.width, effective.height});
 	}
 	static_assert(viewport_slots <= GraphicsDynamicStateShadow::MaxViewports);
 	// Bitwise comparisons: a skipped command must leave bit-identical state.
@@ -888,6 +902,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	m_depth_feedback.valid = false;
 	auto&       cache = m_context.GetTextureCache();
 	RenderState state {};
+	std::tie(state.raster_scale_x, state.raster_scale_y) = m_context.GetRasterScale();
 	state.width                 = std::numeric_limits<uint32_t>::max();
 	state.height                = std::numeric_limits<uint32_t>::max();
 	state.num_layers            = std::numeric_limits<uint32_t>::max();
@@ -923,6 +938,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto& attachment            = state.color_attachments[target.target_slot];
 		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
+		attachment.image            = &image;
+		attachment.mip_level        = view.base_level;
+		attachment.base_layer       = view.base_layer;
 	}
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
@@ -1063,6 +1081,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto&      attachment     = state.depth_stencil_attachment;
 		attachment.image_view     = image_view;
 		attachment.image_layout   = layout;
+		attachment.image          = &image;
+		attachment.mip_level      = view.base_level;
+		attachment.base_layer     = view.base_layer;
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
@@ -1934,7 +1955,7 @@ static void ApplyPreparedDraw(DrawPrep::PreparedDraw& prepared, DrawRenderState&
 }
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           DrawRenderState& state) {
+                           DrawRenderState& state, bool allow_geometry_motion = true) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1990,7 +2011,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.vertex_stages_written = PipelineCache::TessellationActive(buffer.GetUserConfig()) ? 3u : 1u;
 	// Draw-prep: use the draw's speculative preparation when its certificate holds now.
-	if (prepared != nullptr && DrawPrep::Validate(*prepared, state.ps_active, target_export_mapping)) {
+	if (!buffer.GetContext().TemporalInputsNeeded() && prepared != nullptr && DrawPrep::Validate(*prepared, state.ps_active, target_export_mapping)) {
 		ApplyPreparedDraw(*prepared, state);
 		// The binding plan was computed from this preparation (KYTY_DRAW_PREP_BINDINGS).
 		executor.ActivateBindingPlan();
@@ -2015,7 +2036,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
-	    state.stage_preps);
+	    state.stage_preps, allow_geometry_motion && buffer.GetContext().TemporalInputsNeeded());
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -2043,7 +2064,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// KYTY_DRAW_RUN (drawPrep/drawRun.h): a continuation keeps the previous draw's targets (the
 	// entries are still in `state`: the fast reset leaves them, DrawRunCandidate requires it).
 	m_run_slice_offset = render_target_slice_offset;
-	if (DrawRun::Enabled() && DrawRunCandidate(buffer, state, render_target_slice_offset)) {
+	if (!m_context.TemporalInputsNeeded() && m_context.GetRasterScale() == std::pair {1.f, 1.f} && DrawRun::Enabled() && DrawRunCandidate(buffer, state, render_target_slice_offset)) {
 		if (DrawRun::GetMode() == DrawRun::Mode::On) {
 			state.color_count         = m_run.color_count;
 			state.color_slots_written = m_run.color_slots;
@@ -2123,6 +2144,20 @@ void RenderExecutor::DrawRunTargets(CommandBuffer& buffer, const DrawCallInfo& d
 		if (!SameRenderDepthInfo(state.depth_info, reference)) {
 			ReportRenderStateMismatch("the depth target entry resolved over the last draw's");
 			state.depth_info = reference;
+		}
+	}
+	if (state.ps_input_info.geometry_motion_dword != UINT32_MAX) {
+		const auto& color  = state.color_info[0];
+		const auto& view   = color.desc.view_info;
+		const auto  extent = color.Extent();
+		if (state.color_count != 1 || color.target_slot != 0 || view.base_level != 0 ||
+		    view.base_layer != 0 || view.layer_count != 1 ||
+		    !m_context.GetGeometryMotion().SupportsSurface(
+		        m_context.GetTextureCache().GetImage(color.image_id), extent) ||
+		    (state.depth_info.image_id &&
+		     (state.depth_info.desc.info.extent.width < extent.width ||
+		      state.depth_info.desc.info.extent.height < extent.height))) {
+			RefreshShaders(buffer, draw, state, false);
 		}
 	}
 }
@@ -3346,7 +3381,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// transitions, claims, refreshes and depth-feedback bookkeeping would all be repeats.
 		// (Verify mode checks a would-be continuation's acquisition as the continuation's.)
 		const bool acquire_reuse =
-		    DrawRun::Enabled() && DrawRun::AcquireReuseEnabled() && !m_run_verify &&
+		    !m_context.TemporalInputsNeeded() && m_context.GetRasterScale() == std::pair {1.f, 1.f} && DrawRun::Enabled() && DrawRun::AcquireReuseEnabled() && !m_run_verify &&
 		    DrawRunAcquireCandidate(buffer, state, stages, bounded ? &written : nullptr);
 		if (acquire_reuse) {
 			DrawRun::GetTotals().acquire_reused.fetch_add(1, std::memory_order_relaxed);
@@ -3383,6 +3418,64 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	CommitStats::Mark(CommitStats::Phase::AcquireTargets);
+	// Only a pass that survives target acquisition and is then split by motion
+	// capture resumes with LOAD. A split during acquisition restarts with the
+	// guest's own clears (DEPTH_CLEAR_ENABLE), as it did before capture existed.
+	const auto               interrupted = buffer.ActiveRenderState();
+	std::array<uint32_t, 14> motion_push {};
+	if (state.ps_input_info.geometry_motion_dword != UINT32_MAX) {
+		const auto&           vs       = state.vertex_info[0];
+		const auto&           viewport = buffer.GetRegisters().GetScreenViewport().viewports[0];
+		std::vector<uint64_t> key {vs.stage.program->shader_hash,
+		                           state.ps_input_info.stage.program->shader_hash,
+		                           uint64_t(topology),
+		                           draw.index_count,
+		                           uint32_t(emit.vertex_offset),
+		                           emit.first_vertex,
+		                           emit.first_instance,
+		                           draw.instance_count,
+		                           index_source.address,
+		                           index_source.guest_element_size,
+		                           rendering.width,
+		                           rendering.height,
+		                           std::bit_cast<uint32_t>(viewport.xscale),
+		                           std::bit_cast<uint32_t>(viewport.yscale),
+		                           std::bit_cast<uint32_t>(viewport.xoffset),
+		                           std::bit_cast<uint32_t>(viewport.yoffset)};
+		const uint64_t        last_vertex = uint64_t(emit.first_vertex) + draw.index_count;
+		uint32_t              capacity =
+            draw.IsIndexed() || last_vertex > UINT32_MAX ? 0 : uint32_t(last_vertex);
+		for (int i = 0; i < vs.buffers_num; ++i) {
+			const auto& vb = vs.buffers[i];
+			key.insert(key.end(), {vb.addr, vb.stride, vb.num_records, vb.fetch_index});
+			if (vb.fetch_index == 0 && vb.stride != 0)
+				capacity = std::max(capacity, vb.num_records);
+		}
+		key.push_back(capacity);
+		auto& motion         = m_context.GetGeometryMotion();
+		bool  scene_geometry = true;
+		for (const auto* stage: stages) {
+			for (const auto& texture: stage->images) {
+				if (!texture.image_id) continue;
+				const auto& sampled = m_context.GetTextureCache().GetImage(texture.image_id);
+				// A post-processing quad describes its own geometry, not the
+				// scene sampled underneath it. Do not advertise that as scene motion.
+				if (sampled.usage.render_target || sampled.usage.storage) scene_geometry = false;
+			}
+		}
+		if (scene_geometry)
+			motion_push =
+			    motion.PrepareDraw(buffer, key, capacity, emit.first_instance, draw.instance_count);
+		if (state.depth_info.depth_compare_op == vk::CompareOp::eGreater ||
+		    state.depth_info.depth_compare_op == vk::CompareOp::eGreaterOrEqual)
+			motion_push[7] |= 2;
+		EXIT_IF(!motion.Attach(buffer, rendering));
+		const float normalized_viewport[] {(viewport.xoffset - viewport.xscale) / rendering.width,
+		                                   (viewport.yoffset - viewport.yscale) / rendering.height,
+		                                   viewport.xscale * 2 / rendering.width,
+		                                   viewport.yscale * 2 / rendering.height};
+		std::memcpy(motion_push.data() + 8, normalized_viewport, sizeof(normalized_viewport));
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -3439,6 +3532,35 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	CommitStats::Mark(CommitStats::Phase::CommitBindings);
 	if (!mesh_active) CommitIndexBuffer(vk_buffer, index_binding);
 
+	LogDrawPhase(draw.Name(), "BeginRendering");
+	if (!draw.IsIndexed()) {
+		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x400u);
+	}
+	if (indirect != nullptr) {
+		// Pipeline barriers cannot be recorded inside dynamic rendering. Every buffer write is
+		// recorded outside rendering or ends it (ShaderWriteBarrier), so the rendering instance
+		// begun right after the previous barrier needs no new one while it remains active.
+		const auto active = buffer.ActiveRenderingSerial();
+		if (active == 0 || active != m_indirect_barrier_rendering) {
+			{
+				KYTY_GPU_OP_SITE("draw.indirect_args");
+				m_context.GetCommandScheduler().EndRendering();
+			}
+			IndirectArgumentsBarrier(buffer, vk_buffer);
+		}
+	}
+	const auto guest_state = [](RenderState state) {
+		if (state.geometry_motion_attachment) {
+			state.color_attachments[7]       = {};
+			state.num_color_attachments      = 1;
+			state.geometry_motion_attachment = false;
+		}
+		return state;
+	};
+	// Capture barriers may split an otherwise unchanged guest pass. Resume its
+	// attachments with LOAD; clearing depth again would change guest visibility.
+	buffer.BeginRendering(rendering,
+	                      interrupted && guest_state(*interrupted) == guest_state(rendering));
 	// KYTY_DRAW_RUN continuation: the dynamic state is a function of the same registers, targets and
 	// vertex program as the previous draw's, which recorded it into this command buffer; the
 	// shadow shows nothing replaced it since (another pipeline bind or command buffer).
@@ -3480,24 +3602,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		DrawRun::ReportMismatch("dynamic state", g_dynamic_state_emitted - run_dynamic_emitted);
 	}
 
-	LogDrawPhase(draw.Name(), "BeginRendering");
-	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x400u);
-	}
-	if (indirect != nullptr) {
-		// Pipeline barriers cannot be recorded inside dynamic rendering. Every buffer write is
-		// recorded outside rendering or ends it (ShaderWriteBarrier), so the rendering instance
-		// begun right after the previous barrier needs no new one while it remains active.
-		const auto active = buffer.ActiveRenderingSerial();
-		if (active == 0 || active != m_indirect_barrier_rendering) {
-			{
-				KYTY_GPU_OP_SITE("draw.indirect_args");
-				m_context.GetCommandScheduler().EndRendering();
-			}
-			IndirectArgumentsBarrier(buffer, vk_buffer);
-		}
-	}
-	m_context.GetCommandScheduler().BeginRendering(rendering);
 	if (m_depth_feedback.valid) {
 		NoteDepthFeedback(buffer);
 	}
@@ -3513,6 +3617,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	m_dynamic_state.pipeline = pipeline.pipeline;
 	if (state.color_count == 0) {
 		m_dynamic_state.color_write_valid = false;
+	}
+	if (state.ps_input_info.geometry_motion_dword != UINT32_MAX) {
+		m_context.GetGeometryMotion().BeginPass(buffer);
+		const auto& effective = buffer.EffectiveRenderState();
+		const float reciprocal_extent[] {1.f / effective.width, 1.f / effective.height};
+		std::memcpy(motion_push.data() + 12, reciprocal_extent, sizeof(reciprocal_extent));
+		vk_buffer.pushConstants(pipeline.pipeline_layout,
+		                        vk::ShaderStageFlagBits::eVertex |
+		                            vk::ShaderStageFlagBits::eFragment,
+		                        0, sizeof(motion_push), motion_push.data());
+	}
+	if (state.ps_active && state.ps_input_info.raster_scale_dword != UINT32_MAX) {
+		const auto&          effective = buffer.EffectiveRenderState();
+		const float          inverse_scale[] {float(rendering.width) / effective.width,
+		                                      float(rendering.height) / effective.height};
+		vk::ShaderStageFlags push_stages = vk::ShaderStageFlagBits::eFragment;
+		for (const auto& stage: vertex_stages)
+			push_stages |= NativeShaderStage(stage.logical_stage);
+		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages,
+		                        state.ps_input_info.raster_scale_dword * sizeof(uint32_t),
+		                        sizeof(inverse_scale), inverse_scale);
 	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, emit, 0x500u);

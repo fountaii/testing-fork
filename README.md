@@ -158,6 +158,14 @@ the Vulkan/SPIR-V validation rules.
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 
+Optional emulator-wide NVIDIA DLSS Super Resolution / DLAA final-frame
+reconstruction and its limitations are described in [docs/dlss.md](docs/dlss.md).
+It captures supported geometry motion/depth and estimates missing temporal inputs
+from the final game image. Render scale reduces supported host raster passes;
+performance depends on the workload and selected backend.
+Frame pacing diagnostics and repeatable timing captures are described in
+[docs/frame-pacing.md](docs/frame-pacing.md).
+
 Open an **x64 Native Tools Command Prompt for Visual Studio 2022** (or the equivalent Developer
 PowerShell), change to the repository root, and initialize the dependencies:
 

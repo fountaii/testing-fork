@@ -16,6 +16,7 @@ namespace Libs::Graphics {
 
 class Presenter;
 class RenderContext;
+class DlssFrameGeneration;
 
 struct SurfaceCapabilities {
 	vk::SurfaceCapabilitiesKHR        capabilities {};
@@ -71,7 +72,7 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void                                                    UpdateTitle();
+	void                                                    UpdateTitle(bool dlss_active = false, bool new_guest_frame = true, bool dlss_bypassed = false);
 	/// Resizes the drawable surface to the given pixel dimensions.
 	/// Sets `minimized = false` on a positive size; sets `minimized = true` and returns early on a
 	/// nonpositive one.
@@ -88,8 +89,12 @@ struct WindowContext {
 	SurfaceCapabilities            surface_capabilities;
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
+	std::unique_ptr<DlssFrameGeneration> frame_generation;
 	WindowLoopState                loop;
 	std::atomic_bool               minimized     = false;
+	uint64_t title_fps_start = 0, title_frame_number = 0, title_fps_frames = 0;
+	uint64_t title_fg_display_start = 0;
+	bool     title_initialized      = false;
 
 	Common::Mutex mutex;
 

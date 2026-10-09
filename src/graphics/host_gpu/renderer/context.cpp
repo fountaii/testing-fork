@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rasterScale.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -188,7 +189,19 @@ void CountOriginRequest(BarrierOrigin origin) {
 } // namespace
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()),
+      m_raster_scaler(std::make_unique<RasterScaler>(m_graphics, scheduler)) {}
+
+CommandBuffer::~CommandBuffer() = default;
+
+const RenderState& CommandBuffer::EffectiveRenderState() const {
+	return m_raster_scaler->State();
+}
+
+Image* CommandBuffer::RasterColorSource(const Image& image) const {
+	EndRendering();
+	return m_raster_scaler->ColorSource(image);
+}
 
 bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
@@ -343,7 +356,9 @@ void CommandBuffer::RequestBufferBarrier(const vk::BufferMemoryBarrier2& barrier
 
 bool CommandBuffer::BatchImageBarriers(std::span<const vk::ImageMemoryBarrier2> barriers,
                                        vk::CommandBuffer target, bool deferrable) const {
-	if (!BarrierBatchEnabled() || IsInvalid() || target != m_buffer) {
+	// Internal helper transfers must finish before the consumer barriers already
+	// pending when EndRendering was called. Do not merge those two sequences.
+	if (m_internal_recording != 0 || !BarrierBatchEnabled() || IsInvalid() || target != m_buffer) {
 		return false;
 	}
 	if (barriers.empty()) {
@@ -819,7 +834,11 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	}
 }
 
-void CommandBuffer::BeginRendering(const RenderState& state) const {
+std::optional<RenderState> CommandBuffer::ActiveRenderState() const {
+	return m_rendering ? std::optional<RenderState>(m_render_state) : std::nullopt;
+}
+
+void CommandBuffer::BeginRendering(const RenderState& requested, bool preserve_attachments) const {
 	const auto count_control = GetRegisters().GetDepthCountControl();
 	auto&      occlusion     = m_context.GetOcclusionCounter();
 	// A DB_COUNT_CONTROL change matters only when this instance or the next one is counted
@@ -827,8 +846,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	const bool same_control =
 	    m_occlusion_control == count_control ||
 	    (OcclusionCounter::GateEnabled() && !occlusion.Active() && !occlusion.WouldCount(count_control));
-	const bool same_instance = m_rendering && m_render_state == state && same_control;
+	const bool same_instance = m_rendering && m_render_state == requested && same_control;
 	if (same_instance) {
+		m_raster_scaler->RefreshSourceVersions();
 		m_occlusion_control = count_control;
 	}
 	bool barrier_split = false;
@@ -859,15 +879,19 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		CountBatch(GpuOpProfiler::BarrierBatchEvent::RenderSplits);
 		barrier_split = true;
 	}
-	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
-	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
+	auto resumed = requested;
+	if (preserve_attachments) {
+		for (auto& attachment : resumed.color_attachments) attachment.is_clear = false;
+		resumed.depth_stencil_attachment.depth_clear = false;
+		resumed.depth_stencil_attachment.stencil_clear = false;
+	}
 	if (m_rendering) {
 		// Attribution of the end (GpuOps.EndRendering.<site>): a pending barrier that could not
 		// be sunk, or different targets/state/occlusion control.
 		if (barrier_split) {
 			KYTY_GPU_OP_SITE("render.barrier_split");
 			EndRendering();
-		} else if (m_render_state == state) {
+		} else if (m_render_state == requested) {
 			KYTY_GPU_OP_SITE("render.occlusion_control");
 			EndRendering();
 		} else {
@@ -885,6 +909,12 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	if (BarrierBatchEnabled()) {
 		FlushBarriers();
 	}
+	// Native-size passes record no scaler commands. Keep the fork recorder encoded
+	// until a helper actually needs a native command window.
+	const bool  reduced = resumed.raster_scale_x < 1.f || resumed.raster_scale_y < 1.f;
+	const auto& state   = m_raster_scaler->Begin(reduced ? Handle() : m_buffer, resumed);
+	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
+	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	// Query bookkeeping recorded by the occlusion counter below does not access memory that
 	// draws access; it is neither a flush point nor a foreign command.
 	++m_internal_recording;
@@ -936,7 +966,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		                                          depth_stencil.has_depth,
 		                                          static_cast<uint32_t>(db.z_info.format));
 	}
-	m_render_state = state;
+	m_render_state = requested;
 	m_rendering    = true;
 	++m_rendering_serial;
 	m_occlusion_control = count_control;
@@ -962,7 +992,12 @@ void CommandBuffer::EndRendering() const {
 	++m_internal_recording;
 	m_context.GetOcclusionCounter().End();
 	StateSink().endRendering();
-	m_rendering    = false;
+	m_rendering           = false;
+	const auto& effective = m_raster_scaler->State();
+	const bool  reduced =
+	    effective.width != m_render_state.width || effective.height != m_render_state.height;
+	m_raster_scaler->End(reduced ? Handle() : m_buffer);
+	m_context.GetGeometryMotion().EndPass(m_render_state);
 	m_render_state = {};
 	m_context.GetOcclusionCounter().Accumulate();
 	--m_internal_recording;

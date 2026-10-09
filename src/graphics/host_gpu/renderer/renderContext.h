@@ -13,12 +13,15 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/lodStats.h"
 #include "graphics/host_gpu/renderer/occlusion.h"
+#include "graphics/host_gpu/renderer/geometryMotion.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -54,6 +57,25 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionCounter&   GetOcclusionCounter() { return m_occlusion_counter; }
 	LodStatsCounter&    GetLodStats() { return m_lod_stats; }
+	GeometryMotion&     GetGeometryMotion() { return m_geometry_motion; }
+	// Raster pass scale per axis, chosen by presentation from the guest display
+	// and output sizes. 1 renders guest passes at their native size.
+	void SetRasterScale(float x, float y) {
+		m_raster_scale_x.store(x, std::memory_order_relaxed);
+		m_raster_scale_y.store(y, std::memory_order_relaxed);
+	}
+	// Whether presentation consumes temporal inputs (Super Resolution reconstructing,
+	// or Frame Generation active). Geometry motion capture is compiled in only then.
+	void SetTemporalInputsNeeded(bool needed) {
+		m_temporal_inputs_needed.store(needed, std::memory_order_relaxed);
+	}
+	[[nodiscard]] bool TemporalInputsNeeded() const {
+		return m_temporal_inputs_needed.load(std::memory_order_relaxed);
+	}
+	[[nodiscard]] std::pair<float, float> GetRasterScale() const {
+		return {m_raster_scale_x.load(std::memory_order_relaxed),
+		        m_raster_scale_y.load(std::memory_order_relaxed)};
+	}
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -111,6 +133,7 @@ private:
 	TextureCache              m_texture_cache;
 	OcclusionCounter          m_occlusion_counter;
 	LodStatsCounter           m_lod_stats;
+	GeometryMotion            m_geometry_motion;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
@@ -120,6 +143,8 @@ private:
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
+	std::atomic<float>        m_raster_scale_x {1.f}, m_raster_scale_y {1.f};
+	std::atomic<bool>         m_temporal_inputs_needed {false};
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

@@ -1,21 +1,20 @@
 #include "graphics/presentation/window.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
-#include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/dlssFrameGeneration.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
@@ -24,15 +23,16 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -978,7 +978,7 @@ static std::string  g_title_text;
 static SDL_WindowID g_title_window_id     = 0;
 static bool         g_title_update_queued = false;
 
-void WindowContext::UpdateTitle() {
+void WindowContext::UpdateTitle(bool dlss_active, bool new_guest_frame, bool dlss_bypassed) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -988,10 +988,8 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	double                   current_fps    = 0.0;
+	double                   display_fps    = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -1003,21 +1001,51 @@ void WindowContext::UpdateTitle() {
 
 	const auto now       = Common::Timer::QueryPerformanceCounter();
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	frame_num++;
-	fps_frames++;
-	if (now - fps_start >= frequency) {
-		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
-		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
+	const auto fg_display_frames = frame_generation ? frame_generation->TotalPresentedFrames() : 0;
+	if (!title_initialized) {
+		title_fps_start        = now;
+		title_fg_display_start = fg_display_frames;
 	}
+	if (new_guest_frame) {
+		++title_frame_number;
+		++title_fps_frames;
+	}
+	if (now - title_fps_start >= frequency) {
+		current_fps = static_cast<double>(title_fps_frames) * static_cast<double>(frequency) /
+		              static_cast<double>(now - title_fps_start);
+		display_fps = static_cast<double>(fg_display_frames - title_fg_display_start) *
+		              static_cast<double>(frequency) / static_cast<double>(now - title_fps_start);
+		title_fg_display_start = fg_display_frames;
+		title_fps_start        = now;
+		title_fps_frames       = 0;
+	} else if (title_initialized) {
+		return;
+	}
+	title_initialized = true;
+	// With FG, presented frames (rendered + generated) are what the player sees.
+	const bool fg_enabled = frame_generation && frame_generation->Enabled();
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	const auto  reconstruction =
+        Config::GetDlssMode() == Config::DlssMode::Off
+	         ? std::string {}
+	         : fmt::format(" [{}: {}]",
+                          Config::GetUpscaleBackend() == Config::UpscaleBackend::OptiScaler
+	                           ? "OptiScaler"
+	                           : "DLSS",
+                          dlss_active     ? "active"
+	                       : dlss_bypassed ? "native, source >= output"
+	                                       : "inactive");
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}{}{}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, title_frame_number, fg_enabled ? display_fps : current_fps,
+	    reconstruction,
+	    fg_enabled ? (frame_generation->Bridge()
+	                      ? " [OptiScaler FG: XeSS]"
+	                      : (frame_generation->External() ? " [OptiScaler FG: FSR]" : " [FG]"))
+	               : "");
 
 	if (TitleUpdateSync()) {
 		struct TitleUpdate {

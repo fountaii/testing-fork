@@ -36,7 +36,7 @@ public:
 	// image acquisition at the transfer stage, so their top-of-pipe spans would include that wait.
 	enum class Role { Guest, Presenter };
 
-	CommandScheduler(RenderContext& context, GraphicContext& graphics, Role role);
+	CommandScheduler(RenderContext& context, GraphicContext& graphics, Role role = Role::Guest);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
@@ -178,6 +178,8 @@ private:
 	[[nodiscard]] bool PriorityDoneLocked(uint64_t tick) const noexcept;
 
 	MasterSemaphore              m_master;
+	vk::Queue m_queue;
+	Common::Mutex& m_queue_mutex;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;

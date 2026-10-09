@@ -105,6 +105,10 @@ public:
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	// Unique across image lifetimes and changes on every planned GPU write.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> ContentVersion() const noexcept {
+		return {m_instance_id, m_write_version};
+	}
 
 	// Native contents identity. Every recorded write to this image gives it a fresh serial
 	// (Image copy/upload/resolve methods here, TextureCache::MarkImageGpuModified for draws,
@@ -511,6 +515,8 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
+	const uint64_t    m_instance_id;
+	uint64_t          m_write_version    = 0;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;

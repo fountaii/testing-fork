@@ -41,6 +41,7 @@ class RenderContext;
 class CommandScheduler;
 class CommandRecorder;
 class CommandSink;
+class RasterScaler;
 struct RenderExecutorTestAccess;
 
 namespace DrawPrep {
@@ -192,7 +193,7 @@ enum class BarrierOrigin : uint32_t {
 
 class CommandBuffer {
 public:
-	~CommandBuffer() = default;
+	~CommandBuffer();
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
@@ -200,10 +201,11 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
-	// Begins (or continues) the rendering instance for the draw recorded next. Pending batched
-	// barriers are recorded outside rendering first, unless they can be sunk (see above).
-	void BeginRendering(const RenderState& state) const;
+	void BeginRendering(const RenderState& state, bool preserve_attachments = false) const;
+	[[nodiscard]] std::optional<RenderState> ActiveRenderState() const;
 	void EndRendering() const;
+	[[nodiscard]] const RenderState& EffectiveRenderState() const;
+	[[nodiscard]] Image* RasterColorSource(const Image& image) const;
 
 	// Recorder-aware recording (KYTY_CP_RECORDER, commandRecorder.h). A CommandSink has
 	// vk::CommandBuffer's method names; with the recorder off it records natively, exactly as the
@@ -411,6 +413,7 @@ private:
 	mutable bool        m_rendering   = false;
 	mutable uint64_t    m_rendering_serial  = 0;
 	mutable uint32_t    m_occlusion_control = 0;
+	mutable std::unique_ptr<RasterScaler> m_raster_scaler;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

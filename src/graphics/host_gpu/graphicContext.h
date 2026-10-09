@@ -53,9 +53,11 @@ struct GraphicContext {
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
+	bool                               dlss_extensions_enabled               = false;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               diagnostic_checkpoints_enabled        = false;
 	bool                               device_fault_enabled                  = false;
+	bool                               conditional_rendering_enabled         = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;
@@ -116,6 +118,10 @@ struct GraphicContext {
 	// UploadDma worker submits to it. Buffers it touches are created shared by both families.
 	uint32_t                           transfer_queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          transfer_queue        = nullptr;
+	// Same family as the renderer: no queue-family ownership transfers.
+	vk::Queue     present_queue = nullptr;
+	Common::Mutex present_queue_mutex;
+	uint32_t      present_queue_index = 0;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

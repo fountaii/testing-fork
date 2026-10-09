@@ -254,6 +254,7 @@ void EmitReturn(ValueEmitContext& ctx) {
 	EmitLoopGuardReport(ctx.state);
 	EmitBvhNodeReport(ctx.state);
 	EmitKillIfPixelValidMaskInactive(ctx.state);
+	EmitGeometryMotion(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 

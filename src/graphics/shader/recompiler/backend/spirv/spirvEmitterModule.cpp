@@ -264,7 +264,10 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 }
 
 void DefineDescriptors(EmitterState& state) {
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+	if (state.program.bindings.UsesPushData() || GeometryMotionEnabled(state) ||
+	    state.program.stage == ShaderType::Mesh ||
+	    (state.program.stage == ShaderType::Pixel &&
+	     state.input_info.pixel->raster_scale_dword != UINT32_MAX)) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -533,8 +536,7 @@ void DefineInputs(EmitterState& state) {
 	for (const auto& input: state.program.info.inputs) {
 		state.inputs.push_back({input});
 	}
-	if (state.lane_count == 2) {
-		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
+	const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
 		                             const char* name) {
 			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
 				    return input.kind == kind;
@@ -542,11 +544,20 @@ void DefineInputs(EmitterState& state) {
 				state.inputs.push_back({{kind, 0, components, name}});
 			}
 		};
+	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
 		    })) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+		}
+	}
+	if (GeometryMotionEnabled(state)) {
+		if (state.program.stage == ShaderType::Vertex) {
+			add_builtin(IR::StageInputKind::VertexIndex, 1, "gl_VertexIndex");
+			add_builtin(IR::StageInputKind::InstanceIndex, 1, "gl_InstanceIndex");
+		} else {
+			add_builtin(IR::StageInputKind::FragCoord, 4, "gl_FragCoord");
 		}
 	}
 	for (auto& input: state.inputs) {
@@ -769,6 +780,7 @@ void DefineModule(EmitterState& state) {
 	                                  state.program.info.outputs.size());
 	DefineInputs(state);
 	DefineOutputs(state);
+	DefineGeometryMotion(state);
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
 	if (state.requirements.function_lds) {
@@ -799,7 +811,7 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
-	if (UsesPhysicalAddresses(state)) {
+	if ((UsesPhysicalAddresses(state) || (GeometryMotionEnabled(state) && state.program.stage == ShaderType::Vertex))) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -872,7 +884,7 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(UsesPhysicalAddresses(state)
+	state.builder.AddMemoryModel((UsesPhysicalAddresses(state) || (GeometryMotionEnabled(state) && state.program.stage == ShaderType::Vertex))
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);

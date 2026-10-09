@@ -120,6 +120,8 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics, Role role)
     : m_master(graphics,
                role == Role::Guest && CommandRecorder::ConfiguredMode() != CommandRecorder::Mode::Off),
+      m_queue(role == Role::Presenter && graphics.present_queue ? graphics.present_queue : graphics.queue),
+      m_queue_mutex(m_queue != graphics.queue ? graphics.present_queue_mutex : graphics.queue_mutex),
       m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
@@ -740,9 +742,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	}
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+	EXIT_IF(m_queue == nullptr);
 
-	if (graphics.submission_queue.Enabled()) {
+	if (m_queue == graphics.queue && graphics.submission_queue.Enabled()) {
 		KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::QueueDispatch");
 		QueuedSubmission queued {.submit = submit,
 		                         .progress = m_master.GetSubmissionProgress(),
@@ -782,7 +784,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 	uint64_t   tick;
 	{
 		KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::QueueDispatch");
-		Common::LockGuard lock(graphics.queue_mutex);
+		Common::LockGuard lock(m_queue_mutex);
 		if (Profiler::AggregateEnabled()) {
 			std::lock_guard operation_lock(m_operation_mutex);
 			count_boundary();
@@ -812,10 +814,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit, bool force_completion) {
 			KYTY_PROFILER_DETAIL_BLOCK("CommandScheduler::DriverSubmit");
 			HangWatchdog::Scope native(
 			    "vkQueueSubmit-direct",
-			    reinterpret_cast<uint64_t>(static_cast<VkQueue>(graphics.queue)), tick, 0,
+			    reinterpret_cast<uint64_t>(static_cast<VkQueue>(m_queue)), tick, 0,
 			    submit.num_wait_semaphores, submit.num_signal_semaphores);
-			NoteWatchdogSubmit(graphics.queue, submit_info, tick);
-			result = graphics.queue.submit(1, &submit_info, nullptr);
+			NoteWatchdogSubmit(m_queue, submit_info, tick);
+			result = m_queue.submit(1, &submit_info, nullptr);
 		}
 	}
 

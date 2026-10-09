@@ -73,6 +73,11 @@ bool CopyViaBufferBatchEnabled() {
 	return enabled;
 }
 
+uint64_t NextImageId() {
+	static std::atomic<uint64_t> version {0};
+	return version.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
 		case Prospero::ImageType::kColor1D: return vk::ImageType::e1D;
@@ -258,6 +263,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
+	constexpr auto writes =
+	    vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+	    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite |
+	    vk::AccessFlagBits2::eColorAttachmentWrite |
+	    vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eHostWrite;
+	if (destination_access & writes) ++m_write_version;
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
@@ -948,7 +959,7 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info,
              uint32_t sparse_first_level)
-    : info(image_info), live(image_info.data), m_graphics(graphics), m_scheduler(scheduler) {
+    : info(image_info), live(image_info.data), m_graphics(graphics), m_scheduler(scheduler), m_instance_id(NextImageId()) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
 	m_cpu_dirty =
